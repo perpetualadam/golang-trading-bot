@@ -1,0 +1,10 @@
+/bin/
+/bin/*.exe
+*.exe
+/data/events.db
+/data/events.db-*
+/.env
+# Misnamed env copies (never commit tokens)
+.env *.txt
+*golang-trading-bot.txt
+*.log

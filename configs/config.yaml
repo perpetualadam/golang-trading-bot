@@ -1,0 +1,186 @@
+# Capital-first trading core — YAML controls risk, modes, and strategy stack.
+# Copy and edit; keep secrets out of git (use TRADING_MASTER_KEY + encrypted blobs for live keys).
+
+runtime:
+  mode: paper              # paper | live | backtest
+  log_level: info
+  metrics_addr: ":9090"
+  shutdown_timeout: 15s
+
+risk:
+  max_risk_per_trade_pct: 0.5    # hard cap: 0.5% of equity notional per trade
+  max_portfolio_leverage: 1.0
+  max_venue_exposure_pct: 80
+  max_slippage_bps_default: 25
+  daily_drawdown_warn_pct: 1
+  daily_drawdown_soft_pct: 2
+  daily_drawdown_hard_pct: 5
+  var_horizon: 1h
+  var_confidence: 0.95
+  cvar_confidence: 0.95
+  kill_switch_file: ""           # if this file exists, new risk is blocked
+  # 0 = off. Top-of-book on public APIs is often under $5k/side; raise only if you aggregate depth.
+  min_book_depth_usd: 0
+
+execution:
+  max_parallel_venues: 4
+  latency_warn_ms: 800
+  latency_cancel_ms: 2500
+  twap_min_slice_ms: 500
+  enable_maker_preference: true
+
+storage:
+  driver: sqlite
+  dsn: data/events.db
+  encrypt_keys: true
+
+# Telegram: put secrets in .env (TRADING_TELEGRAM_BOT_TOKEN). Optional: TRADING_TELEGRAM_ENABLED=true,
+# TRADING_TELEGRAM_ALLOWED_USER_IDS=123,456. allowed_user_ids empty = anyone who finds the bot can issue commands.
+telegram:
+  enabled: true
+  bot_token: ""
+  allowed_user_ids: []
+
+# name: binance|bybit|okx|deribit|kraken|coinbase|alpaca|oanda|yahoo|yfinance|finnhub|twelvedata|polygon|ccxt
+# Use plaintext keys in *_enc fields for dev, or encrypt with TRADING_MASTER_KEY for deployment.
+# OANDA: set extra.account_id. CCXT sidecar: extra.sidecar_url (e.g. http://127.0.0.1:8099/ccxt).
+# yahoo / yfinance / finnhub / twelvedata / polygon: read-only quotes (orders return ErrReadOnly).
+exchanges:
+  - name: binance
+    enabled: false
+    api_key_enc: ""
+    api_secret_enc: ""
+    passphrase_enc: ""
+    testnet: true
+  - name: bybit
+    enabled: false
+    api_key_enc: ""
+    api_secret_enc: ""
+    testnet: true
+  - name: okx
+    enabled: false
+    api_key_enc: ""
+    api_secret_enc: ""
+    passphrase_enc: ""
+    testnet: false
+    extra:
+      base_url: ""   # optional override, e.g. demo URL
+  - name: deribit
+    enabled: false
+    api_key_enc: ""
+    api_secret_enc: ""
+    testnet: true
+  - name: kraken
+    enabled: false
+    api_key_enc: ""
+    api_secret_enc: ""   # base64 secret from Kraken
+    testnet: false
+  - name: coinbase
+    enabled: false
+    api_key_enc: ""
+    api_secret_enc: ""   # base64-encoded secret (Exchange API)
+    passphrase_enc: ""
+    testnet: false
+  - name: alpaca
+    enabled: false
+    api_key_enc: ""
+    api_secret_enc: ""
+    testnet: true        # true = paper-api.alpaca.markets
+  - name: oanda
+    enabled: false
+    api_key_enc: ""      # bearer token
+    api_secret_enc: ""
+    testnet: true        # true = fxpractice
+    extra:
+      account_id: ""
+  - name: yahoo
+    enabled: false
+  - name: finnhub
+    enabled: false
+    api_key_enc: ""
+  - name: twelvedata
+    enabled: false
+    api_key_enc: ""
+  - name: polygon
+    enabled: false
+    api_key_enc: ""
+  - name: ccxt
+    enabled: false
+    api_key_enc: ""
+    extra:
+      sidecar_url: "http://127.0.0.1:8099/ccxt"
+
+strategies:
+  - id: mom_core
+    type: momentum
+    enabled: true
+    weight: 1.0
+    params:
+      fast: 5
+      slow: 20
+    universe:
+      - BTCUSDT
+  - id: mr_core
+    type: mean_reversion
+    enabled: true
+    weight: 0.8
+    params:
+      lookback: 20
+    universe:
+      - BTCUSDT
+  - id: brk
+    type: breakout
+    enabled: true
+    weight: 0.6
+    params:
+      nbar: 10
+    universe:
+      - BTCUSDT
+  - id: vol
+    type: volatility
+    enabled: false
+    weight: 0.5
+    params:
+      target_ann_vol: 0.2
+    universe:
+      - BTCUSDT
+  - id: sa
+    type: stat_arb
+    enabled: false
+    weight: 0.3
+    universe:
+      - BTCUSDT
+  - id: opt_g
+    type: options_gamma
+    enabled: false
+    weight: 0
+    universe:
+      - BTCUSDT
+  - id: dn
+    type: delta_neutral
+    enabled: false
+    weight: 0
+    universe:
+      - BTCUSDT
+  - id: ml1
+    type: ml_meta
+    enabled: false
+    weight: 0.4
+    universe:
+      - BTCUSDT
+
+backtest:
+  # Required for runtime.mode=backtest: path to your OHLCV CSV (no sample file ships with the repo).
+  data_dir: ""
+  initial_equity: 100000
+  fee_bps: 4
+  slippage_bps: 3
+  walk_forward_train_bars: 200
+  walk_forward_test_bars: 50
+  walk_forward_step_bars: 25
+
+ml:
+  onnx_model_path: ""
+  drift_z_threshold: 3
+  ewma_half_life_bars: 32
+  enable_remote_infer_url: ""
