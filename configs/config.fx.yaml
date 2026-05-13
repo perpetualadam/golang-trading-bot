@@ -13,6 +13,11 @@
 #   Use your secrets file:  go run ./cmd/bot -config configs/config.fx.local.yaml
 #   (or change runtime.mode here; enable exchanges.oanda + api_key_enc + account_id for paper/live.)
 #
+# OANDA practice “like live” with real API fills (demo money only):
+#   - exchanges.oanda.testnet: true  → api-fxpractice.oanda.com
+#   - runtime.mode: live              → orders are sent to that API (practice account fills / positions)
+#   - runtime.mode: paper            → quotes only; orders are NOT sent (use for dry quote testing)
+#
 # testnet: true = practice API; false = live API (real money with live token).
 # Credentials: api_key_enc = OANDA v20 bearer token; extra.account_id = e.g. 101-001-xxxxxx-001.
 # YAML quotes around api_key_enc / account_id are optional — they are not part of the value.

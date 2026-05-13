@@ -169,16 +169,17 @@ func main() {
 	if cfg.Telegram.Enabled && cfg.Telegram.BotToken != "" {
 		tb, err := notify.NewTelegramBot(cfg.Telegram.BotToken, cfg.Telegram.AllowedUserIDs, runner, zlog)
 		if err != nil {
-			zlog.Fatal().Err(err).Msg("telegram")
-		}
-		go tb.Run(ctx)
-		zlog.Info().Msg("telegram bot listening for commands")
-		repEvery := cfg.Telegram.ReportInterval
-		if repEvery <= 0 {
-			repEvery = time.Hour
-		}
-		if len(cfg.Telegram.ReportChatIDs) > 0 {
-			go tb.RunPeriodicReports(ctx, repEvery, cfg.Telegram.ReportChatIDs)
+			zlog.Error().Err(err).Msg("telegram: could not connect (trading continues). Check outbound HTTPS to api.telegram.org, VPN/firewall, or set telegram.enabled: false")
+		} else {
+			go tb.Run(ctx)
+			zlog.Info().Msg("telegram bot listening for commands")
+			repEvery := cfg.Telegram.ReportInterval
+			if repEvery <= 0 {
+				repEvery = time.Hour
+			}
+			if len(cfg.Telegram.ReportChatIDs) > 0 {
+				go tb.RunPeriodicReports(ctx, repEvery, cfg.Telegram.ReportChatIDs)
+			}
 		}
 	} else if cfg.Telegram.Enabled {
 		zlog.Warn().Msg("telegram.enabled but bot_token still empty after scanning env + .env files")
