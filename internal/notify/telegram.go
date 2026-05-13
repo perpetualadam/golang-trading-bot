@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
+	"unicode/utf8"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/rs/zerolog"
@@ -19,6 +21,8 @@ type Controller interface {
 	StatusText(ctx context.Context) string
 	BalancesText(ctx context.Context) string
 	DailyText(ctx context.Context) string
+	ReportText(ctx context.Context) string
+	PerformanceText(ctx context.Context) string
 	RequestNuke()
 	ConfirmNuke(ctx context.Context) error
 	IsNukePending() bool
@@ -145,6 +149,10 @@ func (t *TelegramBot) handle(ctx context.Context, m *tgbotapi.Message) {
 		reply = t.ctl.BalancesText(ctx)
 	case "/daily":
 		reply = t.ctl.DailyText(ctx)
+	case "/report":
+		reply = t.ctl.ReportText(ctx)
+	case "/performance":
+		reply = t.ctl.PerformanceText(ctx)
 	case "/nuke":
 		t.ctl.RequestNuke()
 		reply = "NUKE requested. Send /confirm nuke within 60s to flatten all and halt."
@@ -164,18 +172,96 @@ func (t *TelegramBot) handle(ctx context.Context, m *tgbotapi.Message) {
 		}
 	default:
 		t.log.Debug().Str("cmd", cmd).Msg("telegram: unknown command")
-		reply = "Unknown command. Try /status, /balance, /daily, /pause, /resume, /stop."
+		reply = "Unknown command. Try /status, /performance, /report, /balance, /daily, /pause, /resume, /stop."
 	}
-	msg := tgbotapi.NewMessage(m.Chat.ID, reply)
-	if _, err := t.bot.Send(msg); err != nil {
-		t.log.Warn().Err(err).Int64("chat_id", m.Chat.ID).Msg("telegram send failed")
+	t.sendTextChunks(m.Chat.ID, reply)
+}
+
+// RunPeriodicReports sends ReportText to each chatID every `interval` until ctx is cancelled.
+func (t *TelegramBot) RunPeriodicReports(ctx context.Context, interval time.Duration, chatIDs []int64) {
+	if len(chatIDs) == 0 || interval <= 0 {
+		return
 	}
+	t.log.Info().Dur("interval", interval).Int("chats", len(chatIDs)).Msg("telegram periodic reports started")
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			t.sendScheduledReport(chatIDs)
+		}
+	}
+}
+
+func (t *TelegramBot) sendScheduledReport(chatIDs []int64) {
+	reqCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	text := t.ctl.ReportText(reqCtx)
+	for _, id := range chatIDs {
+		t.sendTextChunks(id, text)
+	}
+}
+
+func (t *TelegramBot) sendTextChunks(chatID int64, s string) {
+	for _, chunk := range splitTelegramUTF16Safe(s, 3800) {
+		msg := tgbotapi.NewMessage(chatID, chunk)
+		if _, err := t.bot.Send(msg); err != nil {
+			t.log.Warn().Err(err).Int64("chat_id", chatID).Msg("telegram send failed")
+		}
+	}
+}
+
+// splitTelegramUTF16Safe splits so each part stays under Telegram's ~4096 *character* limit (they count UTF-16 code units).
+func splitTelegramUTF16Safe(s string, maxUTF16 int) []string {
+	if s == "" {
+		return nil
+	}
+	if maxUTF16 < 256 {
+		maxUTF16 = 256
+	}
+	var out []string
+	for len(s) > 0 {
+		nRunes := 0
+		u16 := 0
+		i := 0
+		for i < len(s) {
+			r, w := utf8.DecodeRuneInString(s[i:])
+			if r == utf8.RuneError && w == 1 {
+				i += w
+				continue
+			}
+			ru := utf16Len(r)
+			if u16+ru > maxUTF16 && nRunes > 0 {
+				break
+			}
+			u16 += ru
+			nRunes++
+			i += w
+		}
+		if nRunes == 0 {
+			if i == 0 {
+				break
+			}
+			// e.g. trailing invalid UTF-8 skipped without forming a rune
+		}
+		out = append(out, s[:i])
+		s = s[i:]
+	}
+	return out
+}
+
+func utf16Len(r rune) int {
+	if r <= 0xffff {
+		return 1
+	}
+	return 2
 }
 
 // SendText sends a plain message to a chat (for alerts).
 func (t *TelegramBot) SendText(chatID int64, s string) {
-	m := tgbotapi.NewMessage(chatID, s)
-	_, _ = t.bot.Send(m)
+	t.sendTextChunks(chatID, s)
 }
 
 // SendPhotoBytes sends PNG.

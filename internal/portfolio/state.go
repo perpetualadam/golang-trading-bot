@@ -1,6 +1,7 @@
 package portfolio
 
 import (
+	"strings"
 	"sync"
 	"time"
 
@@ -37,6 +38,24 @@ func (s *State) UpdatePositions(pos []types.Position) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Positions = make(map[string]types.Position, len(pos))
+	for _, p := range pos {
+		s.Positions[posKey(p.Instrument)] = p
+	}
+}
+
+// ReplaceVenuePositions removes prior rows for venue v then applies pos (multi-venue loops).
+func (s *State) ReplaceVenuePositions(v types.Venue, pos []types.Position) {
+	prefix := string(v) + ":"
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Positions == nil {
+		s.Positions = make(map[string]types.Position)
+	}
+	for k := range s.Positions {
+		if strings.HasPrefix(k, prefix) {
+			delete(s.Positions, k)
+		}
+	}
 	for _, p := range pos {
 		s.Positions[posKey(p.Instrument)] = p
 	}

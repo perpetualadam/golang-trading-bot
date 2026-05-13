@@ -1,11 +1,19 @@
 # Capital-first trading core — YAML controls risk, modes, and strategy stack.
 # Copy and edit; keep secrets out of git (use TRADING_MASTER_KEY + encrypted blobs for live keys).
+#
+# FX (OANDA CFDs): use configs/config.fx.yaml or enable exchanges.oanda, set api_key_enc (v20 bearer
+# token) and extra.account_id. Symbols like OANDA:EUR_USD in strategy universe and/or runtime.instruments.
+# testnet: true = practice API; false = live API. Set runtime.mode: live to route orders to OANDA.
 
 runtime:
   mode: paper              # paper | live | backtest
   log_level: info
+  trade_log_verbose: false  # true: order submit/fill (PAPER venue) or suppressed-intent (paper mode + external venue)
+  loop_log_verbose: false     # true: info log every tick per instrument (bid/ask/mid, signal counts)
   metrics_addr: ":9090"
   shutdown_timeout: 15s
+  # Optional: symbols to run each tick (overrides union of strategy universes). Example FX: ["OANDA:EUR_USD"]
+  instruments: []
 
 risk:
   max_risk_per_trade_pct: 0.5    # hard cap: 0.5% of equity notional per trade
@@ -28,6 +36,12 @@ execution:
   latency_cancel_ms: 2500
   twap_min_slice_ms: 500
   enable_maker_preference: true
+  # Execution router: global default RPS per venue + optional overrides (token bucket).
+  router_default_rps: 25
+  router_burst: 0          # 0 = burst ≈ default RPS
+  router_venue_rps: {}     # e.g. OANDA: 8
+  # Live orders: try primary venue (from intent), then each listed venue until one succeeds. Use only where the symbol is valid on each venue.
+  router_fallback_venues: []
 
 storage:
   driver: sqlite
@@ -40,6 +54,10 @@ telegram:
   enabled: true
   bot_token: ""
   allowed_user_ids: []
+  # Hourly (or report_interval) summary via ReportText — your private chat id with this bot (e.g. from @userinfobot).
+  # Empty list disables scheduled sends; /report still works from an allowed chat.
+  report_chat_ids: []
+  report_interval: 1h
 
 # name: binance|bybit|okx|deribit|kraken|coinbase|alpaca|oanda|yahoo|yfinance|finnhub|twelvedata|polygon|ccxt
 # Use plaintext keys in *_enc fields for dev, or encrypt with TRADING_MASTER_KEY for deployment.
@@ -170,7 +188,10 @@ strategies:
       - BTCUSDT
 
 backtest:
-  # Required for runtime.mode=backtest: path to your OHLCV CSV (no sample file ships with the repo).
+  # Required for runtime.mode=backtest: path to OHLCV CSV (no sample file ships with the repo).
+  # CSV columns: ts,open,high,low,close,volume — ts = Unix seconds UTC.
+  # Optional: instrument for bar labels / strategy matching (e.g. OANDA:EUR_USD). Default is legacy BTCUSDT.
+  instrument: ""
   data_dir: ""
   initial_equity: 100000
   fee_bps: 4

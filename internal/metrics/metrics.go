@@ -25,6 +25,17 @@ var (
 		Name: "trading_risk_rejects_total",
 		Help: "Orders rejected by risk engine",
 	})
+	// ExecutionPlaceDuration is round-trip time for a single PlaceOrder per venue (seconds).
+	ExecutionPlaceDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "trading_execution_place_duration_seconds",
+		Help:    "Exchange PlaceOrder round-trip time in seconds",
+		Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
+	}, []string{"venue"})
+	// ExecutionPlaceSlowTotal counts places exceeding latency_warn_ms (if configured).
+	ExecutionPlaceSlowTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "trading_execution_place_slow_total",
+		Help: "PlaceOrder calls slower than latency_warn_ms",
+	}, []string{"venue"})
 )
 
 // Handler returns HTTP handler for /metrics.

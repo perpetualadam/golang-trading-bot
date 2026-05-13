@@ -4,6 +4,10 @@
 /data/events.db
 /data/events.db-*
 /.env
+# Local overrides with real API keys (use: go run ./cmd/bot -config configs/config.fx.local.yaml)
+configs/config.fx.local.yaml
+configs/*.local.yaml
+configs/*-secrets.yaml
 # Misnamed env copies (never commit tokens)
 .env *.txt
 *golang-trading-bot.txt

@@ -44,6 +44,15 @@ type Runner struct {
 	prevEquity float64
 	eqHistory  []float64
 	eqMu       sync.Mutex
+
+	startedAt time.Time
+	perfMu    sync.Mutex
+	perfLoop  uint64 // main loop ticker firings
+	perfTick  uint64 // onTick invocations (per instrument)
+	perfSig   uint64 // sum of active signals (direction+confidence)
+	perfSigBk uint64 // onTicks with at least one active signal
+	perfOrd   uint64 // placeOrder calls (post risk)
+	perfSup   uint64 // external venue orders suppressed (paper runtime mode)
 }
 
 func NewRunner(cfg *config.Root, log zerolog.Logger, reg *exchange.Registry, r *risk.Engine,
@@ -62,6 +71,7 @@ func NewRunner(cfg *config.Root, log zerolog.Logger, reg *exchange.Registry, r *
 		paper:      paper,
 		corr:       strategy.NewCorrelationMonitor(64, 0.7),
 		prevEquity: pf.Equity(),
+		startedAt:  time.Now(),
 	}
 }
 
@@ -196,43 +206,205 @@ func (r *Runner) DailyText(ctx context.Context) string {
 		eq, dayStart, dayPnl, fillPnl)
 }
 
+// ReportText is the combined hourly / manual Telegram summary (status + daily + balances).
+func (r *Runner) ReportText(ctx context.Context) string {
+	var b strings.Builder
+	b.WriteString("══ Trading report ══\n")
+	b.WriteString(time.Now().UTC().Format(time.RFC3339))
+	b.WriteString("\n\n")
+	b.WriteString(r.StatusText(ctx))
+	b.WriteString("\n")
+	b.WriteString(r.DailyText(ctx))
+	b.WriteString("\n")
+	b.WriteString(r.BalancesText(ctx))
+	return b.String()
+}
+
+// PerformanceText summarizes session counters, portfolio snapshot, and SQLite fill stats.
+func (r *Runner) PerformanceText(ctx context.Context) string {
+	r.perfMu.Lock()
+	loop, tick, sig, sigBk, ord, sup := r.perfLoop, r.perfTick, r.perfSig, r.perfSigBk, r.perfOrd, r.perfSup
+	started := r.startedAt
+	r.perfMu.Unlock()
+
+	eq, dayStart, dayPnl, _ := r.pf.Snapshot()
+	var b strings.Builder
+	fmt.Fprintf(&b, "══ Performance ══\n")
+	fmt.Fprintf(&b, "Since: %s UTC\n", started.UTC().Format(time.RFC3339))
+	fmt.Fprintf(&b, "Uptime: %s\n", time.Since(started).Round(time.Second))
+	fmt.Fprintf(&b, "Runtime mode: %s\n", r.cfg.Mode())
+
+	fmt.Fprintf(&b, "\n-- Session (this process) --\n")
+	fmt.Fprintf(&b, "Main loop ticks: %d\n", loop)
+	fmt.Fprintf(&b, "onTick calls: %d\n", tick)
+	fmt.Fprintf(&b, "Active signals (sum): %d\n", sig)
+	fmt.Fprintf(&b, "Ticks with ≥1 signal: %d\n", sigBk)
+	if tick > 0 {
+		fmt.Fprintf(&b, "Avg signals/tick: %.3f\n", float64(sig)/float64(tick))
+	}
+	fmt.Fprintf(&b, "Order intents (post-risk): %d\n", ord)
+	fmt.Fprintf(&b, "Suppressed (ext. venue, paper runtime): %d\n", sup)
+	if ord >= sup {
+		fmt.Fprintf(&b, "Sent to broker / PAPER sim: %d\n", ord-sup)
+	}
+
+	fmt.Fprintf(&b, "\n-- Portfolio --\n")
+	fmt.Fprintf(&b, "Equity USD: %.2f\n", eq)
+	fmt.Fprintf(&b, "Day start equity: %.2f\n", dayStart)
+	fmt.Fprintf(&b, "Day realized (ledger): %.2f\n", dayPnl)
+	fmt.Fprintf(&b, "Daily DD %%: %.3f\n", r.pf.DailyDrawdownPct())
+
+	if r.store == nil {
+		fmt.Fprintf(&b, "\n-- Fills --\nSQLite storage off (no fill history).\n")
+		fmt.Fprintf(&b, "\nWin rate: use backtest or enable storage for fill counts.\n")
+		return b.String()
+	}
+
+	fs, err := r.store.FillSummary(ctx)
+	if err != nil {
+		fmt.Fprintf(&b, "\n-- Fills --\nError: %v\n", err)
+		return b.String()
+	}
+	fill24h, errP := r.store.DailyPnLFromFills(ctx)
+	if errP != nil {
+		fill24h = 0
+	}
+	fmt.Fprintf(&b, "\n-- Fills (SQLite) --\n")
+	fmt.Fprintf(&b, "Total fills logged: %d\n", fs.TotalFills)
+	fmt.Fprintf(&b, "Fills last 24h: %d\n", fs.Fills24h)
+	fmt.Fprintf(&b, "Buy / sell: %d / %d\n", fs.Buys, fs.Sells)
+	if fs.TotalFills > 0 {
+		fmt.Fprintf(&b, "Buy %% of fills: %.1f%%\n", 100*float64(fs.Buys)/float64(fs.TotalFills))
+	}
+	fmt.Fprintf(&b, "Fees (sum): %.4f\n", fs.FeesTotal)
+	fmt.Fprintf(&b, "Net cash flow (buy/sell rows): %.4f\n", fs.NetCashFlow)
+	fmt.Fprintf(&b, "Approx flow last 24h: %.4f\n", fill24h)
+
+	fmt.Fprintf(&b, "\nWin rate: N/A (requires closed trades).\n")
+	fmt.Fprintf(&b, "Fill mix + flows above; strategy stats → backtest.\n")
+	return b.String()
+}
+
 func (r *Runner) loop(ctx context.Context) {
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
-	ins := types.Instrument{Venue: "PAPER", Symbol: "BTCUSDT", Base: "BTC", Quote: "USDT", Kind: types.MarketSpot, Class: types.AssetCrypto}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
-			r.onTick(ctx, ins)
+			r.perfMu.Lock()
+			r.perfLoop++
+			r.perfMu.Unlock()
+			instruments, err := resolveLoopInstruments(r.cfg)
+			if err != nil {
+				r.log.Error().Err(err).Msg("loop instruments")
+				continue
+			}
+			mids := make(map[string]float64)
+			for _, ins := range instruments {
+				mid := r.onTick(ctx, ins)
+				if mid > 0 {
+					mids[midKey(ins)] = mid
+				}
+			}
+			r.reconcilePortfolio(ctx, instruments, mids)
 		}
 	}
 }
 
-func (r *Runner) onTick(ctx context.Context, ins types.Instrument) {
-	if r.halted {
-		return
+func midKey(ins types.Instrument) string {
+	v := ins.Venue
+	if v == "" {
+		v = "PAPER"
 	}
+	return string(v) + ":" + ins.Symbol
+}
+
+func uniqueVenues(instruments []types.Instrument) []types.Venue {
+	seen := make(map[types.Venue]struct{})
+	var out []types.Venue
+	for _, ins := range instruments {
+		v := ins.Venue
+		if v == "" {
+			v = "PAPER"
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
+func (r *Runner) connectorForVenue(v types.Venue) (exchange.Connector, error) {
+	if v == "" || v == "PAPER" {
+		if r.paper == nil {
+			return nil, fmt.Errorf("paper connector not available")
+		}
+		return r.paper, nil
+	}
+	c, ok := r.reg.Get(string(v))
+	if !ok {
+		return nil, fmt.Errorf("no connector registered for venue %q", v)
+	}
+	return c, nil
+}
+
+func (r *Runner) connectorFor(ins types.Instrument) (exchange.Connector, error) {
+	v := ins.Venue
+	if v == "" {
+		v = "PAPER"
+	}
+	return r.connectorForVenue(v)
+}
+
+// onTick pulls top-of-book from the instrument's venue, runs the strategy stack, and submits orders via paper or execution router.
+func (r *Runner) onTick(ctx context.Context, ins types.Instrument) float64 {
+	if r.halted {
+		return 0
+	}
+	defer func() {
+		r.perfMu.Lock()
+		r.perfTick++
+		r.perfMu.Unlock()
+	}()
 	r.pf.RollDailyIfNeeded(time.Now())
 	now := time.Now().UTC()
-	var book types.BookTop
-	var err error
-	if r.paper != nil {
-		book, err = r.paper.FetchBookTop(ctx, ins)
-		if err != nil {
-			r.log.Warn().Err(err).Msg("book")
-			return
-		}
+	conn, err := r.connectorFor(ins)
+	if err != nil {
+		r.log.Warn().Err(err).Str("venue", string(ins.Venue)).Msg("connector")
+		return 0
+	}
+	book, err := conn.FetchBookTop(ctx, ins)
+	if err != nil {
+		r.log.Warn().Err(err).Str("venue", string(ins.Venue)).Str("symbol", ins.Symbol).Msg("book")
+		return 0
 	}
 	mid := (book.BidPrice + book.AskPrice) / 2
+	if mid <= 0 {
+		return 0
+	}
 	// Single-interval OHLC from live top of book (strategies need a bar; no fabricated series).
 	b := strategy.Bar{Instrument: ins, Timestamp: now.Unix(), Open: mid, High: mid * 1.001, Low: mid * 0.999, Close: mid, Volume: 1}
 
 	sigs, err := r.stack.RunBar(ctx, b)
 	if err != nil {
 		r.log.Error().Err(err).Msg("stack")
-		return
+		return mid
+	}
+	if r.cfg.Runtime.LoopLogVerbose {
+		nAct := 0
+		for _, s := range sigs {
+			if s.Confidence > 0 && math.Abs(s.Direction) >= 1e-8 {
+				nAct++
+			}
+		}
+		r.log.Info().Str("venue", string(ins.Venue)).Str("symbol", ins.Symbol).
+			Int("utc_hour", now.Hour()).Float64("bid", book.BidPrice).Float64("ask", book.AskPrice).Float64("mid", mid).
+			Int("signals", len(sigs)).Int("active_signals", nAct).
+			Msg("tick")
 	}
 	eq, _, _, _ := r.pf.Snapshot()
 	mult := r.corr.ExposureMultiplier()
@@ -248,6 +420,13 @@ func (r *Runner) onTick(ctx context.Context, ins types.Instrument) {
 	if active > 1 {
 		scale = 1.0 / float64(active)
 	}
+
+	r.perfMu.Lock()
+	r.perfSig += uint64(active)
+	if active > 0 {
+		r.perfSigBk++
+	}
+	r.perfMu.Unlock()
 
 	for _, s := range sigs {
 		if r.paused {
@@ -265,9 +444,9 @@ func (r *Runner) onTick(ctx context.Context, ins types.Instrument) {
 			side = types.SideSell
 		}
 		intent := types.OrderIntent{
-			ID:             s.StrategyID + "-" + ins.Symbol,
+			ID:             s.StrategyID + "-" + string(s.Instrument.Venue) + "-" + s.Instrument.Symbol,
 			StrategyID:     s.StrategyID,
-			Instrument:     ins,
+			Instrument:     s.Instrument,
 			Side:           side,
 			Type:           types.OrderMarket,
 			Quantity:       maxQ,
@@ -289,52 +468,173 @@ func (r *Runner) onTick(ctx context.Context, ins types.Instrument) {
 		}
 		_ = maxRisk // reserved for allocator / HRP weighting
 
-		if r.paper != nil {
-			ord, err := r.paper.PlaceOrder(ctx, intent)
-			if err != nil {
-				metrics.OrdersTotal.WithLabelValues(string(r.paper.Name()), "error").Inc()
-				continue
-			}
-			metrics.OrdersTotal.WithLabelValues(string(r.paper.Name()), "ok").Inc()
-			_ = ord
-			if r.store != nil {
-				_ = r.store.LogFill(ctx, types.Fill{
-					OrderID: ord.ID, Instrument: ins, Side: side, Price: ord.AvgPrice, Qty: ord.FilledQty, Fee: ord.FeesPaid, Time: now,
-				})
-			}
-		}
+		r.placeOrder(ctx, intent, side, now)
 	}
+	return mid
+}
 
-	// refresh portfolio from paper
-	if r.paper != nil {
-		pos, _ := r.paper.FetchPositions(ctx)
-		for i := range pos {
-			p := &pos[i]
-			if math.Abs(p.Qty) >= 1e-10 && p.AvgEntry > 0 {
-				p.Unrealized = (mid - p.AvgEntry) * p.Qty
+func (r *Runner) placeOrder(ctx context.Context, intent types.OrderIntent, side types.Side, now time.Time) {
+	r.perfMu.Lock()
+	r.perfOrd++
+	r.perfMu.Unlock()
+
+	v := intent.Instrument.Venue
+	if v == "" {
+		v = "PAPER"
+	}
+	tverbose := r.cfg.Runtime.TradeLogVerbose
+	if v == "PAPER" {
+		if r.paper == nil {
+			return
+		}
+		if tverbose {
+			r.log.Info().Str("run_mode", string(r.cfg.Mode())).Str("venue", string(v)).Str("symbol", intent.Instrument.Symbol).
+				Str("side", string(side)).Str("ord_type", string(intent.Type)).Float64("qty", intent.Quantity).
+				Str("strategy_id", intent.StrategyID).Str("intent_id", intent.ID).Msg("order_submit")
+		}
+		ord, err := r.paper.PlaceOrder(ctx, intent)
+		if err != nil {
+			metrics.OrdersTotal.WithLabelValues(string(r.paper.Name()), "error").Inc()
+			r.log.Warn().Err(err).Str("venue", string(r.paper.Name())).Str("symbol", intent.Instrument.Symbol).Msg("order_place")
+			return
+		}
+		metrics.OrdersTotal.WithLabelValues(string(r.paper.Name()), "ok").Inc()
+		if tverbose {
+			r.log.Info().Str("venue", string(r.paper.Name())).Str("symbol", intent.Instrument.Symbol).Str("side", string(side)).
+				Str("local_id", ord.ID).Str("exchange_id", ord.ExchangeID).Float64("avg_px", ord.AvgPrice).
+				Float64("filled_qty", ord.FilledQty).Float64("fee", ord.FeesPaid).Msg("order_filled")
+		}
+		if r.store != nil {
+			_ = r.store.LogFill(ctx, types.Fill{
+				OrderID: ord.ID, Instrument: intent.Instrument, Side: side, Price: ord.AvgPrice, Qty: ord.FilledQty, Fee: ord.FeesPaid, Time: now,
+			})
+		}
+		return
+	}
+	if r.cfg.Mode() != types.ModeLive {
+		if tverbose {
+			r.log.Info().Str("run_mode", string(r.cfg.Mode())).Str("venue", string(v)).Str("symbol", intent.Instrument.Symbol).
+				Str("side", string(side)).Str("ord_type", string(intent.Type)).Float64("qty", intent.Quantity).
+				Str("strategy_id", intent.StrategyID).Str("intent_id", intent.ID).
+				Msg("paper_mode: order not sent to broker (set runtime.mode: live to execute on venue)")
+		} else {
+			r.log.Debug().Str("venue", string(v)).Str("symbol", intent.Instrument.Symbol).Msg("skip order: runtime.mode is not live")
+		}
+		r.perfMu.Lock()
+		r.perfSup++
+		r.perfMu.Unlock()
+		return
+	}
+	chain := r.executionVenueChain(v)
+	if tverbose {
+		ch := make([]string, len(chain))
+		for i, vv := range chain {
+			ch[i] = string(vv)
+		}
+		r.log.Info().Str("run_mode", string(r.cfg.Mode())).Strs("venue_chain", ch).Str("symbol", intent.Instrument.Symbol).
+			Str("side", string(side)).Str("ord_type", string(intent.Type)).Float64("qty", intent.Quantity).
+			Str("strategy_id", intent.StrategyID).Str("intent_id", intent.ID).Msg("order_submit")
+	}
+	rr, ok := r.router.PlaceFallback(ctx, chain, intent)
+	if !ok {
+		metrics.OrdersTotal.WithLabelValues(string(rr.Venue), "error").Inc()
+		if rr.Err != nil {
+			r.log.Warn().Err(rr.Err).Str("last_venue", string(rr.Venue)).Str("symbol", intent.Instrument.Symbol).Msg("order fallback exhausted")
+		}
+		return
+	}
+	metrics.OrdersTotal.WithLabelValues(string(rr.Venue), "ok").Inc()
+	if tverbose {
+		r.log.Info().Str("venue", string(rr.Venue)).Str("symbol", intent.Instrument.Symbol).Str("side", string(side)).
+			Str("local_id", rr.Order.ID).Str("exchange_id", rr.Order.ExchangeID).Float64("avg_px", rr.Order.AvgPrice).
+			Float64("filled_qty", rr.Order.FilledQty).Float64("fee", rr.Order.FeesPaid).
+			Str("state", string(rr.Order.State)).Dur("rtt", rr.RTT).Msg("order_filled")
+	}
+	if r.store != nil {
+		_ = r.store.LogFill(ctx, types.Fill{
+			OrderID: rr.Order.ID, Instrument: intent.Instrument, Side: side, Price: rr.Order.AvgPrice, Qty: rr.Order.FilledQty, Fee: rr.Order.FeesPaid, Time: now,
+		})
+	}
+}
+
+// executionVenueChain is primary first, then config fallbacks, deduped (case-insensitive).
+func (r *Runner) executionVenueChain(primary types.Venue) []types.Venue {
+	seen := make(map[types.Venue]struct{})
+	var out []types.Venue
+	add := func(raw string) {
+		s := strings.ToUpper(strings.TrimSpace(raw))
+		if s == "" {
+			s = "PAPER"
+		}
+		v := types.Venue(s)
+		if _, ok := seen[v]; ok {
+			return
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	if primary == "" {
+		add("PAPER")
+	} else {
+		add(string(primary))
+	}
+	for _, fb := range r.cfg.Execution.RouterFallbackVenues {
+		add(fb)
+	}
+	return out
+}
+
+func (r *Runner) reconcilePortfolio(ctx context.Context, instruments []types.Instrument, mids map[string]float64) {
+	venues := uniqueVenues(instruments)
+	eq, _, _, _ := r.pf.Snapshot()
+	total := 0.0
+	for _, v := range venues {
+		c, err := r.connectorForVenue(v)
+		if err != nil {
+			r.log.Debug().Err(err).Str("venue", string(v)).Msg("reconcile skip venue")
+			continue
+		}
+		pos, err := c.FetchPositions(ctx)
+		if err != nil {
+			r.log.Warn().Err(err).Str("venue", string(v)).Msg("positions")
+			pos = nil
+		}
+		if v == types.Venue("PAPER") && r.paper != nil {
+			for i := range pos {
+				p := &pos[i]
+				if mid, ok := mids[midKey(p.Instrument)]; ok && math.Abs(p.Qty) >= 1e-10 && p.AvgEntry > 0 {
+					p.Unrealized = (mid - p.AvgEntry) * p.Qty
+				}
 			}
 		}
-		r.pf.UpdatePositions(pos)
-		bals, _ := r.paper.FetchBalances(ctx)
-		usd := 0.0
+		r.pf.ReplaceVenuePositions(v, pos)
+		bals, err := c.FetchBalances(ctx)
+		if err != nil {
+			r.log.Warn().Err(err).Str("venue", string(v)).Msg("balances")
+			bals = nil
+		}
+		sub := 0.0
 		for _, bal := range bals {
 			if bal.Asset == "USD" || bal.Asset == "USDT" {
-				usd += bal.Free + bal.Locked
+				sub += bal.Free + bal.Locked
 			}
 		}
 		for _, p := range pos {
-			usd += p.Unrealized
+			sub += p.Unrealized
 		}
-		if usd <= 0 {
-			usd = eq
+		if sub > 0 {
+			total += sub
 		}
-		r.pf.SetEquity(usd)
-		r.risk.PushReturn(r.prevEquity, usd)
-		r.prevEquity = usd
-		metrics.EquityUSD.Set(usd)
-		metrics.DailyDrawdownPct.Set(r.pf.DailyDrawdownPct())
-		r.pushEqHistory(usd)
 	}
+	if total <= 0 {
+		total = eq
+	}
+	r.pf.SetEquity(total)
+	r.risk.PushReturn(r.prevEquity, total)
+	r.prevEquity = total
+	metrics.EquityUSD.Set(total)
+	metrics.DailyDrawdownPct.Set(r.pf.DailyDrawdownPct())
+	r.pushEqHistory(total)
 }
 
 func (r *Runner) pushEqHistory(v float64) {

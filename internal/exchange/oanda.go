@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +24,8 @@ type OANDA struct {
 }
 
 func NewOANDA(practice bool, token, accountID string) *OANDA {
+	token = strings.TrimSpace(token)
+	accountID = strings.TrimSpace(accountID)
 	base := "https://api-fxtrade.oanda.com"
 	if practice {
 		base = "https://api-fxpractice.oanda.com"
@@ -141,14 +145,32 @@ func (o *OANDA) FetchPositions(ctx context.Context) ([]types.Position, error) {
 	return out, nil
 }
 
+// oandaUnits formats MARKET/LIMIT order units: OANDA rejects high-precision floats (UNITS_PRECISION_EXCEEDED).
+// Most FX majors use whole base-currency units; we round using |quantity| and apply sign from side.
+func oandaUnits(quantity float64, side types.Side) (string, error) {
+	if quantity <= 0 {
+		return "", fmt.Errorf("oanda: quantity must be positive")
+	}
+	u := math.Round(quantity)
+	if u < 1 {
+		return "", fmt.Errorf("oanda: quantity %g rounds below 1 base unit (OANDA minimum step)", quantity)
+	}
+	// Whole units only (EUR_USD, etc.); extend later if instrument.tradeUnitsPrecision is fetched from API.
+	s := strconv.FormatInt(int64(u), 10)
+	if side == types.SideSell {
+		s = "-" + s
+	}
+	return s, nil
+}
+
 func (o *OANDA) PlaceOrder(ctx context.Context, intent types.OrderIntent) (types.Order, error) {
 	if o.Token == "" {
 		return types.Order{}, ErrAuthRequired
 	}
 	u := fmt.Sprintf("%s/accounts/%s/orders", o.BaseURL, o.AccountID)
-	units := fmtQty(intent.Quantity)
-	if intent.Side == types.SideSell {
-		units = "-" + units
+	units, err := oandaUnits(intent.Quantity, intent.Side)
+	if err != nil {
+		return types.Order{}, err
 	}
 	body := map[string]any{
 		"order": map[string]any{
@@ -186,17 +208,45 @@ func (o *OANDA) PlaceOrder(ctx context.Context, intent types.OrderIntent) (types
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return types.Order{}, fmt.Errorf("oanda %d: %s", resp.StatusCode, string(raw))
 	}
-	var ord struct {
+	var wrap struct {
 		OrderCreateTransaction struct {
 			ID string `json:"id"`
 		} `json:"orderCreateTransaction"`
+		OrderFillTransaction *struct {
+			ID         string `json:"id"`
+			OrderID    string `json:"orderID"`
+			Instrument string `json:"instrument"`
+			Units      string `json:"units"`
+			Price      string `json:"price"`
+			Commission string `json:"commission"`
+			Guaranteed string `json:"guaranteedExecutionFee"`
+		} `json:"orderFillTransaction"`
 	}
-	_ = json.Unmarshal(raw, &ord)
+	if err := json.Unmarshal(raw, &wrap); err != nil {
+		return types.Order{}, fmt.Errorf("oanda response: %w", err)
+	}
 	now := time.Now().UTC()
-	return types.Order{
-		ID: intent.ID, ExchangeID: ord.OrderCreateTransaction.ID, Intent: intent,
+	exID := wrap.OrderCreateTransaction.ID
+	if wrap.OrderFillTransaction != nil && strings.TrimSpace(wrap.OrderFillTransaction.OrderID) != "" {
+		exID = strings.TrimSpace(wrap.OrderFillTransaction.OrderID)
+	}
+	out := types.Order{
+		ID: intent.ID, ExchangeID: exID, Intent: intent,
 		State: types.OrderOpen, SubmittedAt: now, UpdatedAt: now,
-	}, nil
+	}
+	if f := wrap.OrderFillTransaction; f != nil {
+		qty := math.Abs(mustParseFloat(f.Units))
+		px := mustParseFloat(f.Price)
+		if qty > 0 && px > 0 {
+			out.FilledQty = qty
+			out.AvgPrice = px
+			out.State = types.OrderFilled
+		}
+		fee := math.Abs(mustParseFloat(f.Commission))
+		fee += math.Abs(mustParseFloat(f.Guaranteed))
+		out.FeesPaid = fee
+	}
+	return out, nil
 }
 
 func (o *OANDA) CancelOrder(ctx context.Context, exchangeOrderID string, ins types.Instrument) error {

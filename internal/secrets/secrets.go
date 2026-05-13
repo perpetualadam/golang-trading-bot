@@ -62,6 +62,14 @@ func DecryptAESGCM(encoded string, key []byte) ([]byte, error) {
 	return gcm.Open(nil, nonce, ct, nil)
 }
 
+// EncryptString encrypts UTF-8 plaintext; empty input returns empty.
+func EncryptString(plaintext string, key []byte) (string, error) {
+	if plaintext == "" {
+		return "", nil
+	}
+	return EncryptAESGCM([]byte(plaintext), key)
+}
+
 // DecryptString decrypts to UTF-8 string; empty input returns empty.
 func DecryptString(encoded string, key []byte) (string, error) {
 	if encoded == "" {

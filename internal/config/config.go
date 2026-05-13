@@ -16,15 +16,15 @@ import (
 
 // Root is the full application configuration.
 type Root struct {
-	Runtime   RuntimeConfig   `mapstructure:"runtime"`
-	Risk      RiskConfig      `mapstructure:"risk"`
-	Execution ExecutionConfig `mapstructure:"execution"`
-	Storage   StorageConfig   `mapstructure:"storage"`
-	Telegram  TelegramConfig  `mapstructure:"telegram"`
-	Exchanges []ExchangeCfg   `mapstructure:"exchanges"`
-	Strategies []StrategyCfg  `mapstructure:"strategies"`
-	Backtest  BacktestConfig  `mapstructure:"backtest"`
-	ML        MLConfig        `mapstructure:"ml"`
+	Runtime    RuntimeConfig   `mapstructure:"runtime"`
+	Risk       RiskConfig      `mapstructure:"risk"`
+	Execution  ExecutionConfig `mapstructure:"execution"`
+	Storage    StorageConfig   `mapstructure:"storage"`
+	Telegram   TelegramConfig  `mapstructure:"telegram"`
+	Exchanges  []ExchangeCfg   `mapstructure:"exchanges"`
+	Strategies []StrategyCfg   `mapstructure:"strategies"`
+	Backtest   BacktestConfig  `mapstructure:"backtest"`
+	ML         MLConfig        `mapstructure:"ml"`
 
 	// StartupHints is filled by Load when Telegram token resolution needs explanation (not from YAML).
 	StartupHints []string `mapstructure:"-"`
@@ -35,21 +35,28 @@ type RuntimeConfig struct {
 	LogLevel        string        `mapstructure:"log_level"`
 	MetricsAddr     string        `mapstructure:"metrics_addr"`
 	ShutdownTimeout time.Duration `mapstructure:"shutdown_timeout"`
+	// TradeLogVerbose logs each order submit and fill at info (PAPER venue / live mode).
+	// In paper mode with a external venue (e.g. OANDA), logs the would-be intent but does not send to the broker.
+	TradeLogVerbose bool `mapstructure:"trade_log_verbose"`
+	// LoopLogVerbose logs every trading loop iteration per instrument (mid, book top, signal count).
+	LoopLogVerbose bool `mapstructure:"loop_log_verbose"`
+	// Instruments optional explicit loop symbols, e.g. ["OANDA:EUR_USD"]. Empty = union of enabled strategy universes, else default PAPER:BTCUSDT.
+	Instruments []string `mapstructure:"instruments"`
 }
 
 type RiskConfig struct {
-	MaxRiskPerTradePct     float64   `mapstructure:"max_risk_per_trade_pct"`
-	MaxPortfolioLeverage   float64   `mapstructure:"max_portfolio_leverage"`
-	MaxVenueExposurePct    float64   `mapstructure:"max_venue_exposure_pct"`
-	MaxSlippageBpsDefault  float64   `mapstructure:"max_slippage_bps_default"`
-	DailyDrawdownWarnPct   float64   `mapstructure:"daily_drawdown_warn_pct"`
-	DailyDrawdownSoftPct   float64   `mapstructure:"daily_drawdown_soft_pct"`
-	DailyDrawdownHardPct   float64   `mapstructure:"daily_drawdown_hard_pct"`
-	VaRHorizon             time.Duration `mapstructure:"var_horizon"`
-	VaRConfidence          float64   `mapstructure:"var_confidence"`
-	CVaRConfidence         float64   `mapstructure:"cvar_confidence"`
-	KillSwitchFile         string    `mapstructure:"kill_switch_file"`
-	MinBookDepthUSD        float64   `mapstructure:"min_book_depth_usd"`
+	MaxRiskPerTradePct    float64       `mapstructure:"max_risk_per_trade_pct"`
+	MaxPortfolioLeverage  float64       `mapstructure:"max_portfolio_leverage"`
+	MaxVenueExposurePct   float64       `mapstructure:"max_venue_exposure_pct"`
+	MaxSlippageBpsDefault float64       `mapstructure:"max_slippage_bps_default"`
+	DailyDrawdownWarnPct  float64       `mapstructure:"daily_drawdown_warn_pct"`
+	DailyDrawdownSoftPct  float64       `mapstructure:"daily_drawdown_soft_pct"`
+	DailyDrawdownHardPct  float64       `mapstructure:"daily_drawdown_hard_pct"`
+	VaRHorizon            time.Duration `mapstructure:"var_horizon"`
+	VaRConfidence         float64       `mapstructure:"var_confidence"`
+	CVaRConfidence        float64       `mapstructure:"cvar_confidence"`
+	KillSwitchFile        string        `mapstructure:"kill_switch_file"`
+	MinBookDepthUSD       float64       `mapstructure:"min_book_depth_usd"`
 }
 
 type ExecutionConfig struct {
@@ -58,47 +65,58 @@ type ExecutionConfig struct {
 	LatencyCancelMs       float64 `mapstructure:"latency_cancel_ms"`
 	TWAPMinSliceMs        int     `mapstructure:"twap_min_slice_ms"`
 	EnableMakerPreference bool    `mapstructure:"enable_maker_preference"`
+	// RouterDefaultRPS is the default token bucket rate for PlaceOrder per venue (0 = use router built-in default).
+	RouterDefaultRPS float64 `mapstructure:"router_default_rps"`
+	// RouterBurst is the token bucket burst size (0 = max(1, int(default RPS))).
+	RouterBurst int `mapstructure:"router_burst"`
+	// RouterVenueRPS optional per-venue RPS overrides (e.g. OANDA: 8).
+	RouterVenueRPS map[string]float64 `mapstructure:"router_venue_rps"`
+	// RouterFallbackVenues: after the intent's primary venue, try these in order until PlaceOrder succeeds (same intent/symbol on each — only list compatible venues).
+	RouterFallbackVenues []string `mapstructure:"router_fallback_venues"`
 }
 
 type StorageConfig struct {
-	Driver   string `mapstructure:"driver"` // sqlite, postgres
-	DSN      string `mapstructure:"dsn"`
-	EncryptKeys bool `mapstructure:"encrypt_keys"`
+	Driver      string `mapstructure:"driver"` // sqlite, postgres
+	DSN         string `mapstructure:"dsn"`
+	EncryptKeys bool   `mapstructure:"encrypt_keys"`
 }
 
 type TelegramConfig struct {
-	Enabled       bool     `mapstructure:"enabled"`
-	BotToken      string   `mapstructure:"bot_token"`
-	AllowedUserIDs []int64 `mapstructure:"allowed_user_ids"`
+	Enabled        bool          `mapstructure:"enabled"`
+	BotToken       string        `mapstructure:"bot_token"`
+	AllowedUserIDs []int64       `mapstructure:"allowed_user_ids"`
+	ReportChatIDs  []int64       `mapstructure:"report_chat_ids"` // hourly summary recipients (private chat id with bot)
+	ReportInterval time.Duration `mapstructure:"report_interval"` // default 1h when report_chat_ids set; 0 = use 1h
 }
 
 type ExchangeCfg struct {
-	Name           string            `mapstructure:"name"`
-	Enabled        bool              `mapstructure:"enabled"`
-	APIKeyEnc      string            `mapstructure:"api_key_enc"`
-	APISecretEnc   string            `mapstructure:"api_secret_enc"`
-	PassphraseEnc  string            `mapstructure:"passphrase_enc"`
-	Testnet        bool              `mapstructure:"testnet"`
-	Extra          map[string]string `mapstructure:"extra"` // account_id (OANDA), base_url (OKX), sidecar_url (CCXT), etc.
+	Name          string            `mapstructure:"name"`
+	Enabled       bool              `mapstructure:"enabled"`
+	APIKeyEnc     string            `mapstructure:"api_key_enc"`
+	APISecretEnc  string            `mapstructure:"api_secret_enc"`
+	PassphraseEnc string            `mapstructure:"passphrase_enc"`
+	Testnet       bool              `mapstructure:"testnet"`
+	Extra         map[string]string `mapstructure:"extra"` // account_id (OANDA), base_url (OKX), sidecar_url (CCXT), etc.
 }
 
 type StrategyCfg struct {
-	ID       string   `mapstructure:"id"`
-	Type     string   `mapstructure:"type"`
-	Enabled  bool     `mapstructure:"enabled"`
-	Weight   float64  `mapstructure:"weight"`
+	ID       string         `mapstructure:"id"`
+	Type     string         `mapstructure:"type"`
+	Enabled  bool           `mapstructure:"enabled"`
+	Weight   float64        `mapstructure:"weight"`
 	Params   map[string]any `mapstructure:"params"`
-	Universe []string `mapstructure:"universe"`
+	Universe []string       `mapstructure:"universe"`
 }
 
 type BacktestConfig struct {
-	DataDir           string  `mapstructure:"data_dir"`
-	InitialEquity     float64 `mapstructure:"initial_equity"`
-	FeeBps            float64 `mapstructure:"fee_bps"`
-	SlippageBps       float64 `mapstructure:"slippage_bps"`
-	WalkForwardTrain  int     `mapstructure:"walk_forward_train_bars"`
-	WalkForwardTest   int     `mapstructure:"walk_forward_test_bars"`
-	WalkForwardStep   int     `mapstructure:"walk_forward_step_bars"`
+	DataDir          string  `mapstructure:"data_dir"`
+	Instrument       string  `mapstructure:"instrument"` // optional e.g. OANDA:EUR_USD or EUR_USD; default legacy BTCUSDT
+	InitialEquity    float64 `mapstructure:"initial_equity"`
+	FeeBps           float64 `mapstructure:"fee_bps"`
+	SlippageBps      float64 `mapstructure:"slippage_bps"`
+	WalkForwardTrain int     `mapstructure:"walk_forward_train_bars"`
+	WalkForwardTest  int     `mapstructure:"walk_forward_test_bars"`
+	WalkForwardStep  int     `mapstructure:"walk_forward_step_bars"`
 }
 
 type MLConfig struct {
@@ -156,6 +174,23 @@ func applyTelegramEnvOverrides(c *Root) {
 		}
 		if len(ids) > 0 {
 			c.Telegram.AllowedUserIDs = ids
+		}
+	}
+	if s := strings.TrimSpace(os.Getenv("TRADING_TELEGRAM_REPORT_CHAT_IDS")); s != "" {
+		var ids []int64
+		for _, p := range strings.Split(s, ",") {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			id, err := strconv.ParseInt(p, 10, 64)
+			if err != nil {
+				continue
+			}
+			ids = append(ids, id)
+		}
+		if len(ids) > 0 {
+			c.Telegram.ReportChatIDs = ids
 		}
 	}
 }

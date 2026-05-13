@@ -20,6 +20,7 @@ import (
 	"tradingbot/internal/exchange"
 	"tradingbot/internal/execution"
 	"tradingbot/internal/metrics"
+	"tradingbot/internal/ml"
 	"tradingbot/internal/notify"
 	"tradingbot/internal/portfolio"
 	"tradingbot/internal/risk"
@@ -28,6 +29,34 @@ import (
 	"tradingbot/internal/strategy"
 	"tradingbot/pkg/types"
 )
+
+// logStrategyIntegrationHints prints one-time notes for strategies that need extra setup (ML, pairs, instruments).
+func logStrategyIntegrationHints(cfg *config.Root, zlog zerolog.Logger) {
+	mlMetaOn := false
+	pairStrategiesOn := false
+	for _, s := range cfg.Strategies {
+		if !s.Enabled {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(s.Type)) {
+		case "ml_meta":
+			mlMetaOn = true
+		case "stat_arb", "delta_neutral":
+			pairStrategiesOn = true
+		}
+	}
+	if mlMetaOn {
+		if strings.TrimSpace(cfg.ML.EnableRemoteInfer) == "" {
+			zlog.Warn().Msg("ml_meta is enabled but ml.enable_remote_infer_url is empty — inference uses the noop runner, so ml_meta will not emit signals until you set a remote URL or implement ONNXRunner with CGO (see internal/ml/onnx.go)")
+		}
+		if strings.TrimSpace(cfg.ML.ONNXModelPath) != "" && strings.TrimSpace(cfg.ML.EnableRemoteInfer) == "" {
+			zlog.Warn().Str("path", cfg.ML.ONNXModelPath).Msg("ml.onnx_model_path is set but this binary does not load local ONNX files yet; use ml.enable_remote_infer_url or wire a CGO ONNXRunner in cmd/bot/main.go")
+		}
+	}
+	if pairStrategiesOn && len(cfg.Runtime.Instruments) > 0 {
+		zlog.Warn().Msg("pair strategies (stat_arb / delta_neutral) are enabled and runtime.instruments is non-empty — every leg symbol must appear in runtime.instruments or that leg never gets ticks")
+	}
+}
 
 func main() {
 	cfgPath := flag.String("config", "configs/config.yaml", "path to YAML config")
@@ -50,6 +79,8 @@ func main() {
 	}
 	zerolog.TimeFieldFormat = time.RFC3339
 	zlog := zerolog.New(os.Stdout).With().Timestamp().Logger().Level(level)
+
+	logStrategyIntegrationHints(cfg, zlog)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -86,12 +117,25 @@ func main() {
 	if err := exchange.RegisterFromConfig(reg, cfg.Exchanges, zlog); err != nil {
 		zlog.Fatal().Err(err).Msg("exchange registry")
 	}
+	logOANDAStartupHints(cfg, zlog)
 
-	rt := execution.NewRouter(reg, cfg.Execution.MaxParallelVenues, cfg.Execution.LatencyWarnMs, cfg.Execution.LatencyCancelMs, 25)
+	rt := execution.NewRouter(reg, execution.RouterConfig{
+		MaxParallel:  cfg.Execution.MaxParallelVenues,
+		WarnMs:       cfg.Execution.LatencyWarnMs,
+		HardCancelMs: cfg.Execution.LatencyCancelMs,
+		DefaultRPS:   cfg.Execution.RouterDefaultRPS,
+		Burst:        cfg.Execution.RouterBurst,
+		VenueRPS:     cfg.Execution.RouterVenueRPS,
+	})
 	pf := portfolio.NewState(100_000)
 	riskEng := risk.NewEngine(&cfg.Risk, pf)
 
-	strats, err := strategy.BuildFromConfig(cfg.Strategies)
+	infer := ml.NewNoopONNX()
+	if u := strings.TrimSpace(cfg.ML.EnableRemoteInfer); u != "" {
+		infer = ml.NewHTTPInfer(u, &http.Client{Timeout: 10 * time.Second})
+	}
+	stratDeps := strategy.StrategyDeps{Infer: infer, ML: cfg.ML}
+	strats, err := strategy.BuildFromConfig(cfg.Strategies, stratDeps)
 	if err != nil {
 		zlog.Fatal().Err(err).Msg("strategies")
 	}
@@ -129,6 +173,13 @@ func main() {
 		}
 		go tb.Run(ctx)
 		zlog.Info().Msg("telegram bot listening for commands")
+		repEvery := cfg.Telegram.ReportInterval
+		if repEvery <= 0 {
+			repEvery = time.Hour
+		}
+		if len(cfg.Telegram.ReportChatIDs) > 0 {
+			go tb.RunPeriodicReports(ctx, repEvery, cfg.Telegram.ReportChatIDs)
+		}
 	} else if cfg.Telegram.Enabled {
 		zlog.Warn().Msg("telegram.enabled but bot_token still empty after scanning env + .env files")
 		for _, h := range cfg.StartupHints {
@@ -152,12 +203,25 @@ func main() {
 }
 
 func runBacktest(ctx context.Context, cfg *config.Root, zlog zerolog.Logger) {
-	strats, err := strategy.BuildFromConfig(cfg.Strategies)
+	logStrategyIntegrationHints(cfg, zlog)
+	infer := ml.NewNoopONNX()
+	if u := strings.TrimSpace(cfg.ML.EnableRemoteInfer); u != "" {
+		infer = ml.NewHTTPInfer(u, &http.Client{Timeout: 10 * time.Second})
+	}
+	stratDeps := strategy.StrategyDeps{Infer: infer, ML: cfg.ML}
+	strats, err := strategy.BuildFromConfig(cfg.Strategies, stratDeps)
 	if err != nil {
 		zlog.Fatal().Err(err).Msg("strategies")
 	}
 	stack := strategy.NewStack(strats)
 	ins := types.Instrument{Venue: "PAPER", Symbol: "BTCUSDT", Base: "BTC", Quote: "USDT", Kind: types.MarketSpot, Class: types.AssetCrypto}
+	if s := strings.TrimSpace(cfg.Backtest.Instrument); s != "" {
+		parsed, err := strategy.ParseSymbol(s)
+		if err != nil {
+			zlog.Fatal().Err(err).Str("instrument", s).Msg("backtest instrument")
+		}
+		ins = parsed
+	}
 	path := strings.TrimSpace(cfg.Backtest.DataDir)
 	if path == "" {
 		zlog.Fatal().Msg("backtest.data_dir is required (path to OHLCV CSV); no bundled sample data")
@@ -167,16 +231,54 @@ func runBacktest(ctx context.Context, cfg *config.Root, zlog zerolog.Logger) {
 		zlog.Fatal().Err(err).Str("path", path).Msg("load csv")
 	}
 	windows := backtest.WalkForward(len(bs.Closes), cfg.Backtest.WalkForwardTrain, cfg.Backtest.WalkForwardTest, cfg.Backtest.WalkForwardStep)
-	zlog.Info().Int("windows", len(windows)).Msg("walk-forward")
 	if len(windows) == 0 {
-		res := backtest.RunSimple(ctx, bs, stack, cfg.Backtest.FeeBps, cfg.Backtest.SlippageBps, cfg.Backtest.InitialEquity)
-		zlog.Info().Float64("final", res.EquityFinal).Float64("max_dd_pct", res.MaxDDPct).Int("trades", res.Trades).Msg("backtest")
+		zlog.Info().Int("bars", len(bs.Closes)).Msg("backtest full series")
+		res := backtest.RunSimple(ctx, bs, stack, cfg.Backtest.FeeBps, cfg.Backtest.SlippageBps, cfg.Backtest.InitialEquity, cfg.Risk.MaxRiskPerTradePct)
+		zlog.Info().
+			Float64("initial", res.InitialEquity).
+			Float64("final", res.EquityFinal).
+			Float64("return_pct", res.ReturnPct).
+			Float64("max_dd_pct", res.MaxDDPct).
+			Int("trades", res.Trades).
+			Int("wins", res.Wins).
+			Int("losses", res.Losses).
+			Float64("win_rate_pct", res.WinRatePct).
+			Float64("profit_factor", res.ProfitFactor).
+			Int64("start_ts", res.StartTS).
+			Int64("end_ts", res.EndTS).
+			Float64("risk_per_trade_pct_cfg", cfg.Risk.MaxRiskPerTradePct).
+			Msg("backtest")
 		return
 	}
+	zlog.Info().Int("windows", len(windows)).Msg("walk-forward")
 	for i, w := range windows {
 		sub := sliceSeries(bs, w.TestStart, w.TestEnd)
-		res := backtest.RunSimple(ctx, sub, stack, cfg.Backtest.FeeBps, cfg.Backtest.SlippageBps, cfg.Backtest.InitialEquity)
-		zlog.Info().Int("i", i).Int("test_start", w.TestStart).Float64("final", res.EquityFinal).Msg("wf window")
+		res := backtest.RunSimple(ctx, sub, stack, cfg.Backtest.FeeBps, cfg.Backtest.SlippageBps, cfg.Backtest.InitialEquity, cfg.Risk.MaxRiskPerTradePct)
+		zlog.Info().Int("i", i).Int("test_start", w.TestStart).Float64("final", res.EquityFinal).
+			Float64("return_pct", res.ReturnPct).Int("trades", res.Trades).
+			Float64("win_rate_pct", res.WinRatePct).Float64("profit_factor", res.ProfitFactor).
+			Int64("start_ts", res.StartTS).Int64("end_ts", res.EndTS).
+			Msg("wf window")
+	}
+}
+
+func logOANDAStartupHints(cfg *config.Root, zlog zerolog.Logger) {
+	for _, e := range cfg.Exchanges {
+		if !e.Enabled {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(e.Name)) != "oanda" {
+			continue
+		}
+		host := "api-fxtrade.oanda.com (live money)"
+		if e.Testnet {
+			host = "api-fxpractice.oanda.com (practice / demo)"
+		}
+		zlog.Info().Str("api_host", host).Bool("exchanges.oanda.testnet", e.Testnet).
+			Msg("OANDA: personal access token must be issued in this same environment; practice token + testnet:false (live host) => 401")
+		if strings.TrimSpace(e.APIKeyEnc) == "" {
+			zlog.Warn().Msg("OANDA api_key_enc is empty")
+		}
 	}
 }
 

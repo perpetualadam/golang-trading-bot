@@ -4,7 +4,6 @@ import (
 	"math"
 
 	"gonum.org/v1/gonum/stat"
-	"tradingbot/internal/strategy"
 )
 
 // Returns computes simple log returns from closes.
@@ -57,14 +56,10 @@ func EWMAVol(logRet []float64, halfLife int) float64 {
 	return math.Sqrt(perBarVar * 252)
 }
 
-// BarFeatures attaches to strategy bar for models.
-func BarFeatures(history []strategy.Bar) (zClose, ewmaVol float64) {
-	if len(history) == 0 {
+// BarFeaturesFromCloses summarizes price history for ML models.
+func BarFeaturesFromCloses(closes []float64) (zClose, ewmaVol float64) {
+	if len(closes) == 0 {
 		return 0, 0
-	}
-	closes := make([]float64, len(history))
-	for i, b := range history {
-		closes[i] = b.Close
 	}
 	z := ZScoreLast(closes)
 	lr := Returns(closes)

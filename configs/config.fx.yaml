@@ -1,0 +1,203 @@
+# OANDA FX profile
+#
+# ── Advanced strategies (volatility, stat_arb, delta_neutral, options_gamma, ml_meta) ──
+# They are implemented in internal/strategy/* and load via strategy.BuildFromConfig in cmd/bot.
+# Enable a block below and tune params; see comments on each strategy. ml_meta needs either
+# ml.enable_remote_infer_url or a custom CGO ONNXRunner (internal/ml/onnx.go).
+#
+# --- Which mode am I running? ---
+# • BACKTEST (CSV only):   runtime.mode: backtest   → this file defaults to that below.
+#   Command:                go run ./cmd/bot -config configs/config.fx.yaml
+#
+# • PAPER / LIVE (quotes, loop):   runtime.mode: paper or live
+#   Use your secrets file:  go run ./cmd/bot -config configs/config.fx.local.yaml
+#   (or change runtime.mode here; enable exchanges.oanda + api_key_enc + account_id for paper/live.)
+#
+# testnet: true = practice API; false = live API (real money with live token).
+# Credentials: api_key_enc = OANDA v20 bearer token; extra.account_id = e.g. 101-001-xxxxxx-001.
+# YAML quotes around api_key_enc / account_id are optional — they are not part of the value.
+# For noisy logs: runtime.loop_log_verbose: true (each ~5s tick: bid/ask/mid/signal count).
+# runtime.trade_log_verbose: true logs order flow; in paper mode, intended OANDA orders log as suppressed (no broker send).
+
+runtime:
+  mode: backtest
+  log_level: info
+  trade_log_verbose: false
+  loop_log_verbose: false
+  metrics_addr: ":9090"
+  shutdown_timeout: 15s
+  instruments:
+    - OANDA:EUR_USD
+
+risk:
+  max_risk_per_trade_pct: 0.5
+  max_portfolio_leverage: 1.0
+  max_venue_exposure_pct: 80
+  max_slippage_bps_default: 25
+  daily_drawdown_warn_pct: 1
+  daily_drawdown_soft_pct: 2
+  daily_drawdown_hard_pct: 5
+  var_horizon: 1h
+  var_confidence: 0.95
+  cvar_confidence: 0.95
+  kill_switch_file: ""
+  min_book_depth_usd: 0
+
+execution:
+  max_parallel_venues: 4
+  latency_warn_ms: 800
+  latency_cancel_ms: 2500
+  twap_min_slice_ms: 500
+  enable_maker_preference: true
+  router_default_rps: 25
+  router_burst: 0
+  router_venue_rps:
+    OANDA: 8
+  router_fallback_venues: []
+
+storage:
+  driver: sqlite
+  dsn: data/events.db
+  encrypt_keys: true
+
+# Prefer TRADING_TELEGRAM_BOT_TOKEN in .env (do not commit tokens in YAML).
+telegram:
+  enabled: false
+  bot_token: ""
+  allowed_user_ids: []
+  report_chat_ids: []
+  report_interval: 1h
+
+# Backtest uses CSV only — keep OANDA disabled unless runtime.mode is paper/live and credentials are set.
+exchanges:
+  - name: oanda
+    enabled: false
+    api_key_enc: ""
+    api_secret_enc: ""
+    passphrase_enc: ""
+    testnet: true
+    extra:
+      account_id: ""
+
+strategies:
+  # If runtime.instruments is set, it overrides the loop list — add every symbol your enabled strategies need
+  # (e.g. stat_arb / delta_neutral need both EUR_USD and GBP_USD in that list when those strategies are enabled).
+  # ema_cross_atr session params are UTC (see tick log utc_hour when loop_log_verbose is on).
+  # Example “real” rule: dual EMA cross + ATR/close minimum + London-hours window (UTC).
+  # volatility / stat_arb / delta_neutral / options_gamma / ml_meta: real logic in code (not stubs).
+  # Pair strategies need two symbols in universe AND in runtime.instruments if you override instruments.
+  - id: fx_ema_atr_ldn
+    type: ema_cross_atr
+    enabled: true
+    weight: 1.0
+    params:
+      fast: 12
+      slow: 26
+      atr_period: 14
+      min_atr_ratio: 0.0001
+      max_atr_ratio: 0
+      session_enabled: true
+      session_utc_start: 8
+      session_utc_end: 17
+    universe:
+      - OANDA:EUR_USD
+  - id: mom_core
+    type: momentum
+    enabled: false
+    weight: 1.0
+    params:
+      fast: 5
+      slow: 20
+    universe:
+      - OANDA:EUR_USD
+  - id: mr_core
+    type: mean_reversion
+    enabled: false
+    weight: 0.8
+    params:
+      lookback: 20
+    universe:
+      - OANDA:EUR_USD
+  - id: brk
+    type: breakout
+    enabled: false
+    weight: 0.6
+    params:
+      nbar: 10
+    universe:
+      - OANDA:EUR_USD
+  - id: vol_core
+    type: volatility
+    enabled: false
+    weight: 0.5
+    params:
+      fast: 8
+      slow: 21
+      tr_half_life_fast: 5
+      tr_half_life_slow: 40
+      expansion_ratio: 1.15
+      min_tr_ratio: 0.00001
+    universe:
+      - OANDA:EUR_USD
+  - id: stat_arb_core
+    type: stat_arb
+    enabled: false
+    weight: 0.4
+    params:
+      hedge: 1.0
+      lookback: 60
+      z_entry: 1.75
+    universe:
+      - OANDA:EUR_USD
+      - OANDA:GBP_USD
+  - id: opt_gamma
+    type: options_gamma
+    enabled: false
+    weight: 0.3
+    params:
+      window: 60
+      high_quantile: 0.82
+      low_quantile: 0.18
+    universe:
+      - OANDA:EUR_USD
+  - id: delta_neutral_core
+    type: delta_neutral
+    enabled: false
+    weight: 0.3
+    params:
+      beta_window: 80
+      lookback: 60
+      z_entry: 1.75
+    universe:
+      - OANDA:EUR_USD
+      - OANDA:GBP_USD
+  - id: ml_meta_core
+    type: ml_meta
+    enabled: false
+    weight: 0.5
+    params:
+      feature_len: 12
+    universe:
+      - OANDA:EUR_USD
+
+backtest:
+  instrument: OANDA:EUR_USD
+  data_dir: data/eurusd_truefx_2025-11_m1.csv
+  initial_equity: 100000
+  fee_bps: 4
+  slippage_bps: 3
+  # Size per signal uses risk.max_risk_per_trade_pct (% of current equity as notional).
+  # Walk-forward: all three must be > 0 to roll windows (each window logs "wf window").
+  # Set to 0 for a single full-sample run → one "backtest" line (final, max_dd_pct, trades).
+  walk_forward_train_bars: 0
+  walk_forward_test_bars: 0
+  walk_forward_step_bars: 0
+
+ml:
+  # onnx_model_path: NOT auto-loaded by the bot yet (startup warns if set without remote URL).
+  onnx_model_path: ""
+  # Drift guard for ml_meta feature norm (0 = off).
+  drift_z_threshold: 3
+  ewma_half_life_bars: 32
+  # HTTP POST inference for ml_meta (JSON body features+input). Env: TRADING_ML_ENABLE_REMOTE_INFER_URL
+  enable_remote_infer_url: ""

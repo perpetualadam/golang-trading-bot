@@ -32,7 +32,7 @@ This project is built so core trading logic stays in Go while storage, messaging
 
 ## Encrypted API keys
 
-- Set `TRADING_MASTER_KEY` in the environment. Store ciphertext in YAML (`api_key_enc`). A small CLI can encrypt plaintext keys offline; decrypt at startup (see `internal/secrets`).
+- Set `TRADING_MASTER_KEY` in the environment. Store ciphertext in YAML (`api_key_enc`, `api_secret_enc`, `passphrase_enc`). Offline helper: `go run ./cmd/secrets encrypt "plaintext"` (loads `.env` like the bot). Decrypt at startup in `cmd/bot` via `internal/secrets`.
 
 ## Telegram
 

@@ -1,5 +1,7 @@
 package strategy
 
+import "strings"
+
 func intFromParams(m map[string]any, key string) (int, bool) {
 	if m == nil {
 		return 0, false
@@ -35,6 +37,30 @@ func floatFromParams(m map[string]any, key string, def float64) float64 {
 		return float64(n)
 	case int64:
 		return float64(n)
+	default:
+		return def
+	}
+}
+
+func boolFromParams(m map[string]any, key string, def bool) bool {
+	if m == nil {
+		return def
+	}
+	v, ok := m[key]
+	if !ok {
+		return def
+	}
+	switch b := v.(type) {
+	case bool:
+		return b
+	case string:
+		return strings.EqualFold(b, "true") || b == "1" || strings.EqualFold(b, "yes")
+	case int:
+		return b != 0
+	case int64:
+		return b != 0
+	case float64:
+		return b != 0
 	default:
 		return def
 	}

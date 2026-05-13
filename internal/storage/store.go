@@ -75,6 +75,36 @@ func (s *Store) LogFill(ctx context.Context, f types.Fill) error {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// FillSummary is aggregate stats from the fills table (execution records).
+type FillSummary struct {
+	TotalFills int64
+	Fills24h   int64
+	Buys       int64
+	Sells      int64
+	FeesTotal  float64
+	// NetCashFlow uses the same buy/sell cash approximation as DailyPnLFromFills (not closed-trade PnL).
+	NetCashFlow float64
+}
+
+// FillSummary returns lifetime and last-24h fill stats.
+func (s *Store) FillSummary(ctx context.Context) (FillSummary, error) {
+	since := time.Now().UTC().Add(-24 * time.Hour).Unix()
+	row := s.db.QueryRowContext(ctx, `
+SELECT
+  COUNT(*),
+  SUM(CASE WHEN ts >= ? THEN 1 ELSE 0 END),
+  SUM(CASE WHEN side = 'buy' THEN 1 ELSE 0 END),
+  SUM(CASE WHEN side = 'sell' THEN 1 ELSE 0 END),
+  COALESCE(SUM(fee), 0),
+  COALESCE(SUM(CASE WHEN side = 'buy' THEN -(qty*price+fee) ELSE (qty*price-fee) END), 0)
+FROM fills`, since)
+	var fs FillSummary
+	if err := row.Scan(&fs.TotalFills, &fs.Fills24h, &fs.Buys, &fs.Sells, &fs.FeesTotal, &fs.NetCashFlow); err != nil {
+		return fs, fmt.Errorf("fill summary: %w", err)
+	}
+	return fs, nil
+}
+
 // DailyPnLFromFills approximates realized PnL from fills table (placeholder; upgrade with positions).
 func (s *Store) DailyPnLFromFills(ctx context.Context) (float64, error) {
 	since := time.Now().UTC().Add(-24 * time.Hour).Unix()
