@@ -66,6 +66,7 @@ storage:
   encrypt_keys: true
 
 # Prefer TRADING_TELEGRAM_BOT_TOKEN in .env (do not commit tokens in YAML).
+# If api.telegram.org is blocked: set HTTPS_PROXY / HTTP_PROXY in .env (see .env.example); bot uses them for Telegram only.
 telegram:
   enabled: false
   bot_token: ""

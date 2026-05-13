@@ -169,7 +169,7 @@ func main() {
 	if cfg.Telegram.Enabled && cfg.Telegram.BotToken != "" {
 		tb, err := notify.NewTelegramBot(cfg.Telegram.BotToken, cfg.Telegram.AllowedUserIDs, runner, zlog)
 		if err != nil {
-			zlog.Error().Err(err).Msg("telegram: could not connect (trading continues). Check outbound HTTPS to api.telegram.org, VPN/firewall, or set telegram.enabled: false")
+			zlog.Error().Err(err).Msg("telegram: could not connect (trading continues). Set HTTPS_PROXY/HTTP_PROXY in .env if you use a proxy; test: curl -I https://api.telegram.org; or telegram.enabled: false")
 		} else {
 			go tb.Run(ctx)
 			zlog.Info().Msg("telegram bot listening for commands")

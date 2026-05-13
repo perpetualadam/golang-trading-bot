@@ -3,6 +3,8 @@ package notify
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -11,6 +13,68 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/rs/zerolog"
 )
+
+const telegramHelpText = `Commands (private chat with this bot):
+/help — this list
+/status — equity, drawdown, open positions
+/performance — session counters, fills summary
+/report — status + daily + balances
+/balance /balances — venue wallet lines
+/daily — day PnL snapshot
+/pause — no new entries (still manages positions)
+/resume — allow new entries
+/start — arm trading loop (if not already running)
+/stop — stop trading loop
+/nuke — request emergency flatten; then send: /confirm nuke
+
+If commands are ignored: your Telegram user id must be in allowed_user_ids (or leave that list empty to allow any user — less secure).
+In Telegram groups, suffix the bot username: /status@YourBotName`
+
+func registerTelegramCommandMenu(b *tgbotapi.BotAPI, log zerolog.Logger) {
+	cmds := []tgbotapi.BotCommand{
+		{Command: "help", Description: "List all commands"},
+		{Command: "start", Description: "Arm trading loop"},
+		{Command: "stop", Description: "Stop trading loop"},
+		{Command: "pause", Description: "Pause new entries"},
+		{Command: "resume", Description: "Resume new entries"},
+		{Command: "status", Description: "Equity and positions"},
+		{Command: "performance", Description: "Session stats and fills"},
+		{Command: "report", Description: "Full trading report"},
+		{Command: "balance", Description: "Venue balances"},
+		{Command: "balances", Description: "Venue balances"},
+		{Command: "daily", Description: "Daily PnL snapshot"},
+		{Command: "nuke", Description: "Request flatten (then /confirm nuke)"},
+		{Command: "confirm", Description: "Confirm nuke: /confirm nuke"},
+	}
+	cfg := tgbotapi.NewSetMyCommandsWithScope(tgbotapi.NewBotCommandScopeAllPrivateChats(), cmds...)
+	if _, err := b.Request(cfg); err != nil {
+		log.Warn().Err(err).Msg("telegram setMyCommands failed (commands still work when typed)")
+	}
+}
+
+// telegramHTTPClient returns a client suitable for api.telegram.org.
+// It honors HTTP_PROXY / HTTPS_PROXY / NO_PROXY (standard Go env vars), uses longer
+// TLS/response timeouts than the default empty http.Client, and enables HTTP/2.
+func telegramHTTPClient() *http.Client {
+	d := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	t := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           d.DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   45 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	return &http.Client{
+		Transport: t,
+		Timeout:   90 * time.Second,
+	}
+}
 
 // Controller is implemented by the main runner for Telegram commands.
 type Controller interface {
@@ -38,7 +102,7 @@ type TelegramBot struct {
 }
 
 func NewTelegramBot(token string, allowed []int64, ctl Controller, log zerolog.Logger) (*TelegramBot, error) {
-	b, err := tgbotapi.NewBotAPI(token)
+	b, err := tgbotapi.NewBotAPIWithClient(token, tgbotapi.APIEndpoint, telegramHTTPClient())
 	if err != nil {
 		return nil, err
 	}
@@ -53,6 +117,7 @@ func NewTelegramBot(token string, allowed []int64, ctl Controller, log zerolog.L
 		}
 	}
 	log.Info().Str("username", b.Self.UserName).Int64("id", b.Self.ID).Msg("telegram bot connected")
+	registerTelegramCommandMenu(b, log)
 	allow := make(map[int64]struct{})
 	for _, id := range allowed {
 		allow[id] = struct{}{}
@@ -125,6 +190,8 @@ func (t *TelegramBot) handle(ctx context.Context, m *tgbotapi.Message) {
 	cmd := telegramBaseCommand(parts[0])
 	var reply string
 	switch cmd {
+	case "/help":
+		reply = telegramHelpText
 	case "/start":
 		if err := t.ctl.StartTrading(ctx); err != nil {
 			reply = "start error: " + err.Error()
@@ -172,7 +239,7 @@ func (t *TelegramBot) handle(ctx context.Context, m *tgbotapi.Message) {
 		}
 	default:
 		t.log.Debug().Str("cmd", cmd).Msg("telegram: unknown command")
-		reply = "Unknown command. Try /status, /performance, /report, /balance, /daily, /pause, /resume, /stop."
+		reply = "Unknown command. Send /help for the list. Try /status, /performance, /report."
 	}
 	t.sendTextChunks(m.Chat.ID, reply)
 }
