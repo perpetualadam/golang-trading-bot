@@ -3,6 +3,7 @@ package strategy
 import (
 	"testing"
 
+	"tradingbot/internal/config"
 	"tradingbot/pkg/types"
 )
 
@@ -36,5 +37,21 @@ func TestParseSymbol_venueCase(t *testing.T) {
 	}
 	if ins.Venue != "OANDA" {
 		t.Fatalf("want uppercase venue, got %q", ins.Venue)
+	}
+}
+
+func TestBuildFromConfig_flattenSessionEnd(t *testing.T) {
+	strategies, err := BuildFromConfig([]config.StrategyCfg{
+		{
+			ID: "fl", Type: "flatten_session_end", Enabled: true,
+			Params:   map[string]any{"session_utc_end": 17},
+			Universe: []string{"OANDA:EUR_USD"},
+		},
+	}, StrategyDeps{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(strategies) != 1 || strategies[0].Type() != "flatten_session_end" {
+		t.Fatalf("%+v", strategies)
 	}
 }

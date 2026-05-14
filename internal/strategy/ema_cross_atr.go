@@ -28,6 +28,9 @@ type EMACrossATR struct {
 	sessionStart   int // UTC hour [0,23]
 	sessionEnd     int // exclusive UTC hour
 
+	stopATRMult  float64 // stop distance in ATR multiples (hard max loss)
+	takeProfitRR float64 // take-profit distance as multiple of stop distance
+
 	state map[string]*emaAtrBarState
 }
 
@@ -56,6 +59,14 @@ func instKey(in types.Instrument) string {
 //   - max_atr_ratio: if > 0, skip when ATR/Close exceeds (default 0 = off)
 //   - session_enabled: if true, only trade inside UTC window (default true)
 //   - session_utc_start, session_utc_end: hour [0,23], end exclusive (default 8, 17)
+//   - stop_atr_mult: stop distance = this * ATR from entry reference (default 1.5)
+//   - take_profit_rr: take-profit distance = this * stop distance (default 2)
+//
+// Cross-style reversals (flatten when a new signal opposes the current position): set either
+//   risk.exit_on_opposite_signal: true, or params.exit_on_opposite_signal: true (merged into risk at load).
+//
+// Flatten-only without a companion: use strategy type flatten_session_end (see NewFlattenSessionEnd), or any
+// strategy that returns types.Signal{ Flatten: true }.
 //
 // Session filter applies only when emitting a signal after a cross: EMA/ATR still
 // advance on every bar so the series stays consistent when the venue streams 24h data.
@@ -88,6 +99,15 @@ func NewEMACrossATR(id string, ins []types.Instrument, params map[string]any) *E
 	}
 	sEn := boolFromParams(params, "session_enabled", true)
 
+	stopM := floatFromParams(params, "stop_atr_mult", 1.5)
+	tpRR := floatFromParams(params, "take_profit_rr", 2)
+	if stopM <= 0 {
+		stopM = 1.5
+	}
+	if tpRR <= 0 {
+		tpRR = 2
+	}
+
 	return &EMACrossATR{
 		id:             id,
 		ins:            ins,
@@ -101,6 +121,8 @@ func NewEMACrossATR(id string, ins []types.Instrument, params map[string]any) *E
 		sessionEnabled: sEn,
 		sessionStart:   sStart,
 		sessionEnd:     sEnd,
+		stopATRMult:    stopM,
+		takeProfitRR:   tpRR,
 		state:          make(map[string]*emaAtrBarState),
 	}
 }
@@ -214,13 +236,27 @@ func (e *EMACrossATR) OnBar(ctx context.Context, b Bar) ([]types.Signal, error) 
 		return nil, nil
 	}
 
+	entry := b.Close
+	riskDist := e.stopATRMult * st.atr
+	var stopPx, tpPx float64
+	if dir > 0 {
+		stopPx = entry - riskDist
+		tpPx = entry + e.takeProfitRR*riskDist
+	} else {
+		stopPx = entry + riskDist
+		tpPx = entry - e.takeProfitRR*riskDist
+	}
+
 	return []types.Signal{{
-		StrategyID: e.id,
-		Instrument: *target,
-		Direction:  dir,
-		Confidence: 0.72,
-		Reason:     reason,
-		Generated:  t,
+		StrategyID:          e.id,
+		Instrument:          *target,
+		Direction:           dir,
+		Confidence:          0.72,
+		Reason:              reason,
+		Generated:           t,
+		EntryReferencePrice: entry,
+		StopLossPrice:       stopPx,
+		TakeProfitPrice:     tpPx,
 	}}, nil
 }
 

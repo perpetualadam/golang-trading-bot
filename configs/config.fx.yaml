@@ -29,13 +29,27 @@ runtime:
   log_level: info
   trade_log_verbose: false
   loop_log_verbose: false
+  # Compare broker open positions to SQLite fill ledger (needs storage + successful position fetch).
+  log_reconcile_position_drift: false
+  # Min |Δqty| to log (0 ≈ 1e-9). Use 1+ for OANDA whole units to reduce noise.
+  reconcile_drift_min_units: 1
   metrics_addr: ":9090"
   shutdown_timeout: 15s
   instruments:
     - OANDA:EUR_USD
 
 risk:
+  # With require_broker_stops, max_risk_per_trade_pct caps loss at the stop distance (vs equity), not bare notional.
   max_risk_per_trade_pct: 0.5
+  require_broker_stops: true
+  # Optional extra cap on entry notional vs equity (0 = off). Use e.g. 2–5% if you want a notional ceiling beyond stop-risk sizing.
+  max_notional_per_trade_pct: 0
+  # Wall-clock cap on positions opened by this process (e.g. 4h, 30m). 0 = off. Bracket SL/TP still apply; this sends a flattening market order.
+  max_position_hold: 0
+  # If true, a signal against the current net position flattens first (reverse entry waits until a later tick after reconcile).
+  # Can also set true under ema_cross_atr params.exit_on_opposite_signal (merged at config load).
+  exit_on_opposite_signal: false
+  # OANDA: hard stop + bracket on create is required for production; trailing stop on the same order as fixed SL is not supported by the API.
   max_portfolio_leverage: 1.0
   max_venue_exposure_pct: 80
   max_slippage_bps_default: 25
@@ -92,6 +106,18 @@ strategies:
   # Example “real” rule: dual EMA cross + ATR/close minimum + London-hours window (UTC).
   # volatility / stat_arb / delta_neutral / options_gamma / ml_meta: real logic in code (not stubs).
   # Pair strategies need two symbols in universe AND in runtime.instruments if you override instruments.
+  # Optional: place flatten_session_end *before* fx_ema_atr_ldn so scheduled flatten runs before entries on the same tick.
+  # - id: fx_flatten_before_close
+  #   type: flatten_session_end
+  #   enabled: false
+  #   weight: 1.0
+  #   params:
+  #     session_enabled: true
+  #     session_utc_start: 8
+  #     session_utc_end: 17
+  #     flatten_minutes_before_end: 5
+  #   universe:
+  #     - OANDA:EUR_USD
   - id: fx_ema_atr_ldn
     type: ema_cross_atr
     enabled: true
@@ -100,11 +126,14 @@ strategies:
       fast: 12
       slow: 26
       atr_period: 14
+      stop_atr_mult: 1.5
+      take_profit_rr: 2
       min_atr_ratio: 0.0001
       max_atr_ratio: 0
       session_enabled: true
       session_utc_start: 8
       session_utc_end: 17
+      # exit_on_opposite_signal: true  # merges into risk.exit_on_opposite_signal (OR) for cross-style reversals
     universe:
       - OANDA:EUR_USD
   - id: mom_core

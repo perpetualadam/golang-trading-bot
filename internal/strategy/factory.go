@@ -42,6 +42,8 @@ func BuildFromConfig(cfgs []config.StrategyCfg, deps StrategyDeps) ([]Strategy, 
 			out = append(out, NewMLMeta(c.ID, ins, c.Params, deps.Infer, deps.ML))
 		case "ema_cross_atr":
 			out = append(out, NewEMACrossATR(c.ID, ins, c.Params))
+		case "flatten_session_end":
+			out = append(out, NewFlattenSessionEnd(c.ID, ins, c.Params))
 		default:
 			return nil, fmt.Errorf("unknown strategy type %q", c.Type)
 		}

@@ -10,6 +10,11 @@ import (
 
 var ErrNotImplemented = errors.New("exchange adapter not implemented")
 
+// TradeExitUpdater amends broker-held exits on an open trade (e.g. OANDA PUT /accounts/.../trades/{id}).
+type TradeExitUpdater interface {
+	UpdateTradeExits(ctx context.Context, tradeID string, ins types.Instrument, stopLoss, takeProfit float64) error
+}
+
 // Connector is the minimal surface strategies and execution need.
 type Connector interface {
 	Name() types.Venue

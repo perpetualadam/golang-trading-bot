@@ -10,13 +10,19 @@ runtime:
   log_level: info
   trade_log_verbose: false  # true: order submit/fill (PAPER venue) or suppressed-intent (paper mode + external venue)
   loop_log_verbose: false     # true: info log every tick per instrument (bid/ask/mid, signal counts)
+  log_reconcile_position_drift: false  # warn when broker open qty ≠ SQLite fill-derived net (needs storage)
+  reconcile_drift_min_units: 1        # min |Δqty| to log; 0 uses ~1e-9 threshold
   metrics_addr: ":9090"
   shutdown_timeout: 15s
   # Optional: symbols to run each tick (overrides union of strategy universes). Example FX: ["OANDA:EUR_USD"]
   instruments: []
 
 risk:
-  max_risk_per_trade_pct: 0.5    # hard cap: 0.5% of equity notional per trade
+  max_risk_per_trade_pct: 0.5    # stop-risk % of equity when SL is set; else notional % cap (venues without brackets)
+  require_broker_stops: false     # true for OANDA production: strategies must emit SL+TP; orders attach stopLossOnFill/takeProfitOnFill
+  max_notional_per_trade_pct: 0   # optional secondary notional cap vs equity (0 = off)
+  max_position_hold: 0            # e.g. 4h — bot-initiated flatten after wall clock (0 = off); bracket orders still active at broker
+  exit_on_opposite_signal: false  # flatten when a new signal opposes current snapshot position before entry
   max_portfolio_leverage: 1.0
   max_venue_exposure_pct: 80
   max_slippage_bps_default: 25

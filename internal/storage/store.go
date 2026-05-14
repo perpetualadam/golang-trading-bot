@@ -117,3 +117,32 @@ func (s *Store) DailyPnLFromFills(ctx context.Context) (float64, error) {
 	}
 	return pnl, nil
 }
+
+// NetOpenQtyByVenueSymbol returns signed net quantity from all fills: buys minus sells per venue+symbol.
+// Keys are "VENUE:SYMBOL" (empty venue coalesced to ""). Compare to broker open position Qty for drift checks.
+func (s *Store) NetOpenQtyByVenueSymbol(ctx context.Context) (map[string]float64, error) {
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("store not open")
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT COALESCE(NULLIF(venue,''), ''),
+       symbol,
+       COALESCE(SUM(CASE WHEN side = 'buy' THEN qty WHEN side = 'sell' THEN -qty ELSE 0 END), 0)
+FROM fills
+GROUP BY COALESCE(NULLIF(venue,''), ''), symbol`)
+	if err != nil {
+		return nil, fmt.Errorf("net open qty: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[string]float64)
+	for rows.Next() {
+		var ven, sym string
+		var net float64
+		if err := rows.Scan(&ven, &sym, &net); err != nil {
+			return nil, err
+		}
+		k := ven + ":" + sym
+		out[k] = net
+	}
+	return out, rows.Err()
+}

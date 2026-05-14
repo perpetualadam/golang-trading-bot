@@ -84,15 +84,17 @@ func Allocate(signals []types.Signal, stratWeights map[string]float64, equity fl
 			side = types.SideSell
 		}
 		out = append(out, types.OrderIntent{
-			ID:             s.StrategyID + "-" + s.Instrument.Symbol,
-			StrategyID:     s.StrategyID,
-			Instrument:     s.Instrument,
-			Side:           side,
-			Type:           types.OrderLimit,
-			Quantity:       0, // filled by runner
-			MaxSlippageBps: 15,
-			ClientTag:      s.Reason,
-			CreatedAt:      s.Generated,
+			ID:              s.StrategyID + "-" + s.Instrument.Symbol,
+			StrategyID:      s.StrategyID,
+			Instrument:      s.Instrument,
+			Side:            side,
+			Type:            types.OrderLimit,
+			Quantity:        0, // filled by runner
+			StopLossPrice:   s.StopLossPrice,
+			TakeProfitPrice: s.TakeProfitPrice,
+			MaxSlippageBps:  15,
+			ClientTag:       s.Reason,
+			CreatedAt:       s.Generated,
 		})
 	}
 	return out

@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 
@@ -92,6 +93,58 @@ func TestEMACrossATR_sessionBlocksEmit(t *testing.T) {
 	}
 	if inside < 1 {
 		t.Fatalf("expected at least one signal inside session, got %d", inside)
+	}
+}
+
+func TestEMACrossATR_stopAndTargetOnSignal(t *testing.T) {
+	ctx := context.Background()
+	ins, err := ParseSymbol("OANDA:EUR_USD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	params := map[string]any{
+		"fast":              3,
+		"slow":              5,
+		"atr_period":        3,
+		"min_atr_ratio":     0.0,
+		"session_enabled":   false,
+		"stop_atr_mult":     1.0,
+		"take_profit_rr":    2.0,
+	}
+	s := NewEMACrossATR("t", []types.Instrument{ins}, params)
+	base := time.Date(2025, 5, 1, 10, 0, 0, 0, time.UTC)
+	var last []types.Signal
+	for i := 0; i < 12; i++ {
+		c := 1.20 - float64(i)*0.02
+		h, low := c+0.005, c-0.005
+		ts := base.Add(time.Duration(i) * time.Minute)
+		if i == 11 {
+			c, h, low = 1.35, 1.38, 1.28
+		}
+		var err2 error
+		last, err2 = s.OnBar(ctx, Bar{
+			Instrument: ins,
+			Timestamp:  ts.Unix(),
+			Open:       c, High: h, Low: low, Close: c, Volume: 0,
+		})
+		if err2 != nil {
+			t.Fatal(err2)
+		}
+	}
+	if len(last) != 1 {
+		t.Fatalf("expected 1 signal on cross bar, got %d", len(last))
+	}
+	sig := last[0]
+	if sig.StopLossPrice <= 0 || sig.TakeProfitPrice <= 0 || sig.EntryReferencePrice <= 0 {
+		t.Fatalf("missing exit prices: %+v", sig)
+	}
+	risk := math.Abs(sig.EntryReferencePrice - sig.StopLossPrice)
+	reward := math.Abs(sig.TakeProfitPrice - sig.EntryReferencePrice)
+	if math.Abs(reward/risk-2.0) > 1e-6 {
+		t.Fatalf("RR want ~2, got %v (risk=%v reward=%v)", reward/risk, risk, reward)
+	}
+	if sig.Direction > 0 && !(sig.StopLossPrice < sig.EntryReferencePrice && sig.TakeProfitPrice > sig.EntryReferencePrice) {
+		t.Fatalf("long geometry bad: entry=%v stop=%v tp=%v", sig.EntryReferencePrice, sig.StopLossPrice, sig.TakeProfitPrice)
 	}
 }
 

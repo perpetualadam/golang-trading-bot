@@ -40,11 +40,17 @@ type RuntimeConfig struct {
 	TradeLogVerbose bool `mapstructure:"trade_log_verbose"`
 	// LoopLogVerbose logs every trading loop iteration per instrument (mid, book top, signal count).
 	LoopLogVerbose bool `mapstructure:"loop_log_verbose"`
+	// LogReconcilePositionDrift compares broker open positions to SQLite fill-derived net qty per venue+symbol and logs warn on mismatch.
+	LogReconcilePositionDrift bool `mapstructure:"log_reconcile_position_drift"`
+	// ReconcileDriftMinUnits minimum |broker_qty − ledger_qty| to log (0 = log any drift above 1e-9).
+	ReconcileDriftMinUnits float64 `mapstructure:"reconcile_drift_min_units"`
 	// Instruments optional explicit loop symbols, e.g. ["OANDA:EUR_USD"]. Empty = union of enabled strategy universes, else default PAPER:BTCUSDT.
 	Instruments []string `mapstructure:"instruments"`
 }
 
 type RiskConfig struct {
+	// MaxRiskPerTradePct caps loss at the stop (when stop-loss is set) as % of equity,
+	// or caps entry notional vs equity when no stop is used (legacy / non-bracket venues).
 	MaxRiskPerTradePct    float64       `mapstructure:"max_risk_per_trade_pct"`
 	MaxPortfolioLeverage  float64       `mapstructure:"max_portfolio_leverage"`
 	MaxVenueExposurePct   float64       `mapstructure:"max_venue_exposure_pct"`
@@ -57,6 +63,14 @@ type RiskConfig struct {
 	CVaRConfidence        float64       `mapstructure:"cvar_confidence"`
 	KillSwitchFile        string        `mapstructure:"kill_switch_file"`
 	MinBookDepthUSD       float64       `mapstructure:"min_book_depth_usd"`
+	// RequireBrokerStops: when true, OANDA intents must include stop + take-profit prices.
+	RequireBrokerStops bool `mapstructure:"require_broker_stops"`
+	// MaxNotionalPerTradePct optional secondary cap: entry notional vs equity (0 = disabled).
+	MaxNotionalPerTradePct float64 `mapstructure:"max_notional_per_trade_pct"`
+	// MaxPositionHold wall-clock max time to hold a position opened by this bot (0 = disabled). Uses fill timestamps; does not apply to pre-existing broker positions until the next bot-originated add.
+	MaxPositionHold time.Duration `mapstructure:"max_position_hold"`
+	// ExitOnOppositeSignal: before a new entry, flatten if signal direction opposes current snapshot position (reverse waits until next tick).
+	ExitOnOppositeSignal bool `mapstructure:"exit_on_opposite_signal"`
 }
 
 type ExecutionConfig struct {
@@ -147,6 +161,8 @@ func Load(path string) (*Root, error) {
 
 	applyTelegramEnvOverrides(&c)
 	c.StartupHints = mergeTelegramBotToken(&c, path)
+
+	mergeStrategyRiskFlags(&c)
 
 	if err := c.validate(); err != nil {
 		return nil, err
@@ -282,6 +298,55 @@ func mergeTelegramBotToken(c *Root, configPath string) []string {
 	return hints
 }
 
+// mergeStrategyRiskFlags merges strategy-level knobs into risk.* (OR semantics so YAML risk.* stays authoritative when already true).
+func mergeStrategyRiskFlags(c *Root) {
+	for _, s := range c.Strategies {
+		if !s.Enabled {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(s.Type)) != "ema_cross_atr" {
+			continue
+		}
+		if paramBoolOR(s.Params, "exit_on_opposite_signal", "exit_on_opposite") {
+			c.Risk.ExitOnOppositeSignal = true
+		}
+	}
+}
+
+func paramBoolOR(m map[string]any, keys ...string) bool {
+	for _, k := range keys {
+		if paramBool(m, k) {
+			return true
+		}
+	}
+	return false
+}
+
+func paramBool(m map[string]any, key string) bool {
+	if m == nil {
+		return false
+	}
+	v, ok := m[key]
+	if !ok {
+		return false
+	}
+	switch b := v.(type) {
+	case bool:
+		return b
+	case string:
+		ls := strings.ToLower(strings.TrimSpace(b))
+		return ls == "true" || ls == "1" || ls == "yes" || ls == "on"
+	case int:
+		return b != 0
+	case int64:
+		return b != 0
+	case float64:
+		return b != 0
+	default:
+		return false
+	}
+}
+
 func (c *Root) validate() error {
 	if c.Risk.MaxRiskPerTradePct <= 0 || c.Risk.MaxRiskPerTradePct > 0.5 {
 		return fmt.Errorf("risk.max_risk_per_trade_pct must be in (0, 0.5] (capital rule: max 0.5%%)")
@@ -289,9 +354,18 @@ func (c *Root) validate() error {
 	if c.Risk.DailyDrawdownHardPct <= 0 {
 		return fmt.Errorf("daily_drawdown_hard_pct must be positive")
 	}
+	if c.Risk.MaxNotionalPerTradePct < 0 || c.Risk.MaxNotionalPerTradePct > 100 {
+		return fmt.Errorf("risk.max_notional_per_trade_pct must be in [0, 100] (0 disables cap)")
+	}
+	if c.Risk.MaxPositionHold < 0 {
+		return fmt.Errorf("risk.max_position_hold must be >= 0")
+	}
 	m := types.Mode(strings.ToLower(c.Runtime.Mode))
 	if m != types.ModePaper && m != types.ModeLive && m != types.ModeBacktest {
 		return fmt.Errorf("runtime.mode must be paper, live, or backtest")
+	}
+	if c.Runtime.ReconcileDriftMinUnits < 0 {
+		return fmt.Errorf("runtime.reconcile_drift_min_units must be >= 0")
 	}
 	return nil
 }

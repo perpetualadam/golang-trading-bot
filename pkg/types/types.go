@@ -79,8 +79,14 @@ type OrderIntent struct {
 	PostOnly     bool
 	ReduceOnly   bool
 	MaxSlippageBps float64
-	ClientTag    string
-	CreatedAt    time.Time
+	// StopLossPrice / TakeProfitPrice are absolute prices for venues that support
+	// broker-held brackets (e.g. OANDA takeProfitOnFill / stopLossOnFill). 0 = none.
+	StopLossPrice   float64
+	TakeProfitPrice float64
+	// ClientOrderID optional idempotency key (e.g. OANDA clientExtensions.id). Empty = derive from Intent.ID server-side.
+	ClientOrderID string
+	ClientTag     string
+	CreatedAt     time.Time
 }
 
 // OrderState tracks lifecycle after submission.
@@ -99,6 +105,8 @@ const (
 type Order struct {
 	ID           string
 	ExchangeID   string
+	// ExchangeTradeID is set when the venue associates a position with a trade (e.g. OANDA tradeOpenedID).
+	ExchangeTradeID string
 	Intent       OrderIntent
 	State        OrderState
 	FilledQty    float64
@@ -158,6 +166,13 @@ type Signal struct {
 	Confidence float64 // 0..1
 	Reason     string
 	Generated  time.Time
+	// EntryReferencePrice is the strategy’s reference for exits (e.g. bar close).
+	EntryReferencePrice float64
+	// StopLossPrice / TakeProfitPrice are absolute prices for the proposed trade.
+	StopLossPrice   float64
+	TakeProfitPrice float64
+	// Flatten requests flattening any open position for this instrument (no new entry from this signal).
+	Flatten bool
 }
 
 // Mode selects paper vs live behavior.

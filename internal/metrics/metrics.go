@@ -25,6 +25,11 @@ var (
 		Name: "trading_risk_rejects_total",
 		Help: "Orders rejected by risk engine",
 	})
+	// ReconcilePositionDriftTotal counts internal-vs-broker position qty mismatches (per warn log).
+	ReconcilePositionDriftTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "trading_reconcile_position_drift_total",
+		Help: "Broker vs ledger net position drift events",
+	}, []string{"venue"})
 	// ExecutionPlaceDuration is round-trip time for a single PlaceOrder per venue (seconds).
 	ExecutionPlaceDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "trading_execution_place_duration_seconds",

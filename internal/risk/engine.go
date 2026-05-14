@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +20,8 @@ var (
 	ErrExposureLimit   = errors.New("exposure limit")
 	ErrSlippage        = errors.New("slippage tolerance")
 	ErrLiquidity       = errors.New("liquidity filter")
+	ErrMissingExitPlan = errors.New("missing stop or take-profit for broker-held exits")
+	ErrInvalidExits    = errors.New("invalid stop/take-profit vs entry reference")
 )
 
 // Engine performs pre-trade checks and portfolio risk metrics.
@@ -73,6 +76,9 @@ func (e *Engine) PreTrade(intent types.OrderIntent, book types.BookTop, equityUS
 	if _, hard := e.CheckDailyDrawdown(); hard {
 		return ErrCircuitBreaker
 	}
+	if intent.ReduceOnly {
+		return e.preTradeCommon(intent, book, equityUSD, 0, true)
+	}
 	if equityUSD <= 0 {
 		return ErrExposureLimit
 	}
@@ -83,10 +89,56 @@ func (e *Engine) PreTrade(intent types.OrderIntent, book types.BookTop, equityUS
 	if ref <= 0 {
 		return ErrLiquidity
 	}
+	if e.mustAttachOANDAExits(intent) {
+		if intent.StopLossPrice <= 0 || intent.TakeProfitPrice <= 0 {
+			return ErrMissingExitPlan
+		}
+		if err := e.validateExitGeometry(intent, ref); err != nil {
+			return err
+		}
+		riskPerUnit := math.Abs(ref - intent.StopLossPrice)
+		if riskPerUnit <= 0 {
+			return ErrInvalidExits
+		}
+		riskUSD := intent.Quantity * riskPerUnit
+		riskBudget := equityUSD * (e.cfg.MaxRiskPerTradePct / 100)
+		if riskUSD > riskBudget+1e-9 {
+			return ErrExposureLimit
+		}
+		return e.preTradeCommon(intent, book, equityUSD, ref, false)
+	}
+	if intent.StopLossPrice > 0 {
+		if err := e.validateExitGeometry(intent, ref); err != nil {
+			return err
+		}
+		riskPerUnit := math.Abs(ref - intent.StopLossPrice)
+		if riskPerUnit <= 0 {
+			return ErrInvalidExits
+		}
+		riskUSD := intent.Quantity * riskPerUnit
+		riskBudget := equityUSD * (e.cfg.MaxRiskPerTradePct / 100)
+		if riskUSD > riskBudget+1e-9 {
+			return ErrExposureLimit
+		}
+		return e.preTradeCommon(intent, book, equityUSD, ref, false)
+	}
 	notional := ref * intent.Quantity
 	riskPct := (notional / equityUSD) * 100
 	if riskPct > e.cfg.MaxRiskPerTradePct {
 		return ErrExposureLimit
+	}
+	return e.preTradeCommon(intent, book, equityUSD, ref, false)
+}
+
+func (e *Engine) preTradeCommon(intent types.OrderIntent, book types.BookTop, equityUSD float64, ref float64, reduceOnly bool) error {
+	if !reduceOnly && equityUSD <= 0 {
+		return ErrExposureLimit
+	}
+	if !reduceOnly && ref > 0 && e.cfg.MaxNotionalPerTradePct > 0 {
+		notional := ref * intent.Quantity
+		if (notional/equityUSD)*100 > e.cfg.MaxNotionalPerTradePct {
+			return ErrExposureLimit
+		}
 	}
 	depth := math.Min(book.BidSize*book.BidPrice, book.AskSize*book.AskPrice)
 	if e.cfg.MinBookDepthUSD > 0 && depth < e.cfg.MinBookDepthUSD {
@@ -102,6 +154,36 @@ func (e *Engine) PreTrade(intent types.OrderIntent, book types.BookTop, equityUS
 		if spreadBps > slipBps*2 { // coarse: wide spread vs tolerance
 			return ErrSlippage
 		}
+	}
+	return nil
+}
+
+func (e *Engine) mustAttachOANDAExits(intent types.OrderIntent) bool {
+	if !e.cfg.RequireBrokerStops {
+		return false
+	}
+	return strings.EqualFold(string(intent.Instrument.Venue), "OANDA")
+}
+
+func (e *Engine) validateExitGeometry(intent types.OrderIntent, ref float64) error {
+	if ref <= 0 {
+		return ErrLiquidity
+	}
+	tol := math.Max(1e-10, ref*1e-6)
+	if intent.Side == types.SideBuy {
+		if intent.StopLossPrice >= ref-tol {
+			return ErrInvalidExits
+		}
+		if intent.TakeProfitPrice > 0 && intent.TakeProfitPrice <= ref+tol {
+			return ErrInvalidExits
+		}
+		return nil
+	}
+	if intent.StopLossPrice <= ref+tol {
+		return ErrInvalidExits
+	}
+	if intent.TakeProfitPrice > 0 && intent.TakeProfitPrice >= ref-tol {
+		return ErrInvalidExits
 	}
 	return nil
 }
@@ -167,6 +249,20 @@ func (e *Engine) MaxPositionQtyFromRisk(price float64, equityUSD float64) float6
 	}
 	maxNotional := equityUSD * (e.cfg.MaxRiskPerTradePct / 100)
 	return maxNotional / price
+}
+
+// MaxPositionQtyFromStop sizes |qty| so loss at the stop is approximately MaxRiskPerTradePct of equity
+// (quote-currency / USD approximation: |entryRef - stop| * qty).
+func (e *Engine) MaxPositionQtyFromStop(entryRefPrice, stopPrice float64, equityUSD float64) float64 {
+	if entryRefPrice <= 0 || equityUSD <= 0 {
+		return 0
+	}
+	riskPerUnit := math.Abs(entryRefPrice - stopPrice)
+	if riskPerUnit <= 0 {
+		return 0
+	}
+	budget := equityUSD * (e.cfg.MaxRiskPerTradePct / 100)
+	return budget / riskPerUnit
 }
 
 // NowUTC helper for tests.
