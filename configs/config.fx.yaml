@@ -22,7 +22,9 @@
 # Credentials: api_key_enc = OANDA v20 bearer token; extra.account_id = e.g. 101-001-xxxxxx-001.
 # YAML quotes around api_key_enc / account_id are optional — they are not part of the value.
 # For noisy logs: runtime.loop_log_verbose: true (each ~5s tick: bid/ask/mid/signal count).
-# runtime.trade_log_verbose: true logs order flow; in paper mode, intended OANDA orders log as suppressed (no broker send).
+# runtime.trade_log_verbose: true adds intent_id, venue_chain, broker ids, rtt to order logs.
+# Order submit/fill always log at info: side, action (BUY/SELL), qty, notional_usd, notional_pct_equity / filled_*.
+# In paper runtime mode, intended external venue orders log as suppressed (no broker send).
 
 runtime:
   mode: backtest

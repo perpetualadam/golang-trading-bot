@@ -8,7 +8,7 @@
 runtime:
   mode: paper              # paper | live | backtest
   log_level: info
-  trade_log_verbose: false  # true: order submit/fill (PAPER venue) or suppressed-intent (paper mode + external venue)
+  trade_log_verbose: false  # false: still logs order_submit/fill with side, BUY/SELL, qty, notional_% ; true: also intent_id, venue_chain, ids, rtt
   loop_log_verbose: false     # true: info log every tick per instrument (bid/ask/mid, signal counts)
   log_reconcile_position_drift: false  # warn when broker open qty ≠ SQLite fill-derived net (needs storage)
   reconcile_drift_min_units: 1        # min |Δqty| to log; 0 uses ~1e-9 threshold

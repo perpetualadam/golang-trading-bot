@@ -35,8 +35,9 @@ type RuntimeConfig struct {
 	LogLevel        string        `mapstructure:"log_level"`
 	MetricsAddr     string        `mapstructure:"metrics_addr"`
 	ShutdownTimeout time.Duration `mapstructure:"shutdown_timeout"`
-	// TradeLogVerbose logs each order submit and fill at info (PAPER venue / live mode).
-	// In paper mode with a external venue (e.g. OANDA), logs the would-be intent but does not send to the broker.
+	// TradeLogVerbose adds intent_id, venue_chain, fees, rtt, and exchange ids to order_submit / order_filled.
+	// Core side (buy/sell), qty, and notional % of equity are logged at info whenever orders run (paper or live).
+	// In paper runtime mode with an external venue (e.g. OANDA), logs the would-be intent but does not send to the broker.
 	TradeLogVerbose bool `mapstructure:"trade_log_verbose"`
 	// LoopLogVerbose logs every trading loop iteration per instrument (mid, book top, signal count).
 	LoopLogVerbose bool `mapstructure:"loop_log_verbose"`

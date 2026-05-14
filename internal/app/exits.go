@@ -144,7 +144,16 @@ func (r *Runner) closeVenuePosition(ctx context.Context, ins types.Instrument, r
 		metrics.RiskRejects.Inc()
 		return
 	}
+	refPx := book.AskPrice
+	if side == types.SideSell {
+		refPx = book.BidPrice
+	}
+	if refPx <= 0 {
+		refPx = (book.BidPrice + book.AskPrice) / 2
+	}
 	r.log.Info().Str("reason", reason).Str("symbol", ins.Symbol).Str("venue", string(ins.Venue)).
-		Float64("qty", qty).Str("side", string(side)).Msg("manual exit order")
-	r.placeOrder(ctx, intent, side, now)
+		Float64("qty", qty).Str("side", string(side)).Str("action", tradeActionLabel(side)).
+		Float64("notional_pct_equity", pctOfEquity(qty*refPx, eq)).
+		Msg("manual exit order")
+	r.placeOrder(ctx, intent, side, now, tradeLogCtx{RefPrice: refPx, EquityUSD: eq})
 }

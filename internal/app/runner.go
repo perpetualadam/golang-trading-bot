@@ -364,6 +364,52 @@ func (r *Runner) connectorFor(ins types.Instrument) (exchange.Connector, error) 
 	return r.connectorForVenue(v)
 }
 
+// tradeLogCtx supplies reference price and equity for notional / %-of-equity log fields.
+type tradeLogCtx struct {
+	RefPrice  float64
+	EquityUSD float64
+}
+
+func tradeActionLabel(side types.Side) string {
+	switch side {
+	case types.SideBuy:
+		return "BUY"
+	case types.SideSell:
+		return "SELL"
+	default:
+		return string(side)
+	}
+}
+
+func zerologSubmitNotional(ev *zerolog.Event, qty, refPx, equity float64) *zerolog.Event {
+	if refPx > 0 && qty > 0 {
+		n := qty * refPx
+		ev = ev.Float64("notional_usd", n)
+		if equity > 0 {
+			ev = ev.Float64("notional_pct_equity", 100*n/equity)
+		}
+	}
+	return ev
+}
+
+func zerologFilledNotional(ev *zerolog.Event, filledQty, avgPx, equity float64) *zerolog.Event {
+	if avgPx > 0 && filledQty > 0 {
+		n := filledQty * avgPx
+		ev = ev.Float64("filled_notional_usd", n)
+		if equity > 0 {
+			ev = ev.Float64("filled_notional_pct_equity", 100*n/equity)
+		}
+	}
+	return ev
+}
+
+func pctOfEquity(notional, equity float64) float64 {
+	if equity <= 0 || notional <= 0 {
+		return 0
+	}
+	return 100 * notional / equity
+}
+
 // onTick pulls top-of-book from the instrument's venue, runs the strategy stack, and submits orders via paper or execution router.
 func (r *Runner) onTick(ctx context.Context, ins types.Instrument) float64 {
 	if r.halted {
@@ -525,12 +571,12 @@ func (r *Runner) onTick(ctx context.Context, ins types.Instrument) float64 {
 		}
 		_ = maxRisk // reserved for allocator / HRP weighting
 
-		r.placeOrder(ctx, intent, side, now)
+		r.placeOrder(ctx, intent, side, now, tradeLogCtx{RefPrice: refPx, EquityUSD: eq})
 	}
 	return mid
 }
 
-func (r *Runner) placeOrder(ctx context.Context, intent types.OrderIntent, side types.Side, now time.Time) {
+func (r *Runner) placeOrder(ctx context.Context, intent types.OrderIntent, side types.Side, now time.Time, tlc tradeLogCtx) {
 	r.perfMu.Lock()
 	r.perfOrd++
 	r.perfMu.Unlock()
@@ -540,27 +586,46 @@ func (r *Runner) placeOrder(ctx context.Context, intent types.OrderIntent, side 
 		v = "PAPER"
 	}
 	tverbose := r.cfg.Runtime.TradeLogVerbose
+	eqForPct := tlc.EquityUSD
+	if eqForPct <= 0 {
+		eqForPct = r.pf.Equity()
+	}
 	if v == "PAPER" {
 		if r.paper == nil {
 			return
 		}
-		if tverbose {
-			r.log.Info().Str("run_mode", string(r.cfg.Mode())).Str("venue", string(v)).Str("symbol", intent.Instrument.Symbol).
-				Str("side", string(side)).Str("ord_type", string(intent.Type)).Float64("qty", intent.Quantity).
-				Str("strategy_id", intent.StrategyID).Str("intent_id", intent.ID).Msg("order_submit")
+		paperVenue := string(r.paper.Name())
+		subEv := r.log.Info().Str("run_mode", string(r.cfg.Mode())).Str("venue", paperVenue).Str("symbol", intent.Instrument.Symbol).
+			Str("side", string(side)).Str("action", tradeActionLabel(side)).Str("ord_type", string(intent.Type)).
+			Float64("qty", intent.Quantity).Str("strategy_id", intent.StrategyID)
+		if intent.ReduceOnly {
+			subEv = subEv.Bool("reduce_only", true)
 		}
+		subEv = zerologSubmitNotional(subEv, intent.Quantity, tlc.RefPrice, tlc.EquityUSD)
+		if tverbose {
+			subEv = subEv.Str("intent_id", intent.ID)
+		}
+		subEv.Msg("order_submit")
 		ord, err := r.paper.PlaceOrder(ctx, intent)
 		if err != nil {
 			metrics.OrdersTotal.WithLabelValues(string(r.paper.Name()), "error").Inc()
-			r.log.Warn().Err(err).Str("venue", string(r.paper.Name())).Str("symbol", intent.Instrument.Symbol).Msg("order_place")
+			r.log.Warn().Err(err).Str("venue", paperVenue).Str("symbol", intent.Instrument.Symbol).
+				Str("side", string(side)).Str("action", tradeActionLabel(side)).Float64("qty", intent.Quantity).Msg("order_place")
 			return
 		}
 		metrics.OrdersTotal.WithLabelValues(string(r.paper.Name()), "ok").Inc()
-		if tverbose {
-			r.log.Info().Str("venue", string(r.paper.Name())).Str("symbol", intent.Instrument.Symbol).Str("side", string(side)).
-				Str("local_id", ord.ID).Str("exchange_id", ord.ExchangeID).Float64("avg_px", ord.AvgPrice).
-				Float64("filled_qty", ord.FilledQty).Float64("fee", ord.FeesPaid).Msg("order_filled")
+		fillEv := r.log.Info().Str("venue", paperVenue).Str("symbol", intent.Instrument.Symbol).
+			Str("side", string(side)).Str("action", tradeActionLabel(side)).
+			Float64("avg_px", ord.AvgPrice).Float64("filled_qty", ord.FilledQty).Float64("fee", ord.FeesPaid).
+			Str("strategy_id", intent.StrategyID)
+		if intent.ReduceOnly {
+			fillEv = fillEv.Bool("reduce_only", true)
 		}
+		fillEv = zerologFilledNotional(fillEv, ord.FilledQty, ord.AvgPrice, eqForPct)
+		if tverbose {
+			fillEv = fillEv.Str("local_id", ord.ID).Str("exchange_id", ord.ExchangeID).Str("intent_id", intent.ID)
+		}
+		fillEv.Msg("order_filled")
 		if r.store != nil && ord.FilledQty > 0 {
 			_ = r.store.LogFill(ctx, types.Fill{
 				OrderID: ord.ID, Instrument: intent.Instrument, Side: side, Price: ord.AvgPrice, Qty: ord.FilledQty, Fee: ord.FeesPaid, Time: now,
@@ -570,45 +635,61 @@ func (r *Runner) placeOrder(ctx context.Context, intent types.OrderIntent, side 
 		return
 	}
 	if r.cfg.Mode() != types.ModeLive {
-		if tverbose {
-			r.log.Info().Str("run_mode", string(r.cfg.Mode())).Str("venue", string(v)).Str("symbol", intent.Instrument.Symbol).
-				Str("side", string(side)).Str("ord_type", string(intent.Type)).Float64("qty", intent.Quantity).
-				Str("strategy_id", intent.StrategyID).Str("intent_id", intent.ID).
-				Msg("paper_mode: order not sent to broker (set runtime.mode: live to execute on venue)")
-		} else {
-			r.log.Debug().Str("venue", string(v)).Str("symbol", intent.Instrument.Symbol).Msg("skip order: runtime.mode is not live")
+		skipEv := r.log.Info().Str("run_mode", string(r.cfg.Mode())).Str("venue", string(v)).Str("symbol", intent.Instrument.Symbol).
+			Str("side", string(side)).Str("action", tradeActionLabel(side)).Str("ord_type", string(intent.Type)).
+			Float64("qty", intent.Quantity).Str("strategy_id", intent.StrategyID)
+		if intent.ReduceOnly {
+			skipEv = skipEv.Bool("reduce_only", true)
 		}
+		skipEv = zerologSubmitNotional(skipEv, intent.Quantity, tlc.RefPrice, tlc.EquityUSD)
+		if tverbose {
+			skipEv = skipEv.Str("intent_id", intent.ID)
+		}
+		skipEv.Msg("paper_mode: order not sent to broker (set runtime.mode: live to execute on venue)")
 		r.perfMu.Lock()
 		r.perfSup++
 		r.perfMu.Unlock()
 		return
 	}
 	chain := r.executionVenueChain(v)
+	subLive := r.log.Info().Str("run_mode", string(r.cfg.Mode())).Str("venue", string(v)).Str("symbol", intent.Instrument.Symbol).
+		Str("side", string(side)).Str("action", tradeActionLabel(side)).Str("ord_type", string(intent.Type)).
+		Float64("qty", intent.Quantity).Str("strategy_id", intent.StrategyID)
+	if intent.ReduceOnly {
+		subLive = subLive.Bool("reduce_only", true)
+	}
+	subLive = zerologSubmitNotional(subLive, intent.Quantity, tlc.RefPrice, tlc.EquityUSD)
 	if tverbose {
 		ch := make([]string, len(chain))
 		for i, vv := range chain {
 			ch[i] = string(vv)
 		}
-		r.log.Info().Str("run_mode", string(r.cfg.Mode())).Strs("venue_chain", ch).Str("symbol", intent.Instrument.Symbol).
-			Str("side", string(side)).Str("ord_type", string(intent.Type)).Float64("qty", intent.Quantity).
-			Str("strategy_id", intent.StrategyID).Str("intent_id", intent.ID).Msg("order_submit")
+		subLive = subLive.Strs("venue_chain", ch).Str("intent_id", intent.ID)
 	}
+	subLive.Msg("order_submit")
 	rr, ok := r.router.PlaceFallback(ctx, chain, intent)
 	if !ok {
 		metrics.OrdersTotal.WithLabelValues(string(rr.Venue), "error").Inc()
 		if rr.Err != nil {
-			r.log.Warn().Err(rr.Err).Str("last_venue", string(rr.Venue)).Str("symbol", intent.Instrument.Symbol).Msg("order fallback exhausted")
+			r.log.Warn().Err(rr.Err).Str("last_venue", string(rr.Venue)).Str("symbol", intent.Instrument.Symbol).
+				Str("side", string(side)).Str("action", tradeActionLabel(side)).Float64("qty", intent.Quantity).Msg("order fallback exhausted")
 		}
 		return
 	}
 	metrics.OrdersTotal.WithLabelValues(string(rr.Venue), "ok").Inc()
-	if tverbose {
-		r.log.Info().Str("venue", string(rr.Venue)).Str("symbol", intent.Instrument.Symbol).Str("side", string(side)).
-			Str("local_id", rr.Order.ID).Str("exchange_id", rr.Order.ExchangeID).Str("trade_id", rr.Order.ExchangeTradeID).
-			Float64("avg_px", rr.Order.AvgPrice).
-			Float64("filled_qty", rr.Order.FilledQty).Float64("fee", rr.Order.FeesPaid).
-			Str("state", string(rr.Order.State)).Dur("rtt", rr.RTT).Msg("order_filled")
+	fillLive := r.log.Info().Str("venue", string(rr.Venue)).Str("symbol", intent.Instrument.Symbol).
+		Str("side", string(side)).Str("action", tradeActionLabel(side)).
+		Float64("avg_px", rr.Order.AvgPrice).Float64("filled_qty", rr.Order.FilledQty).Float64("fee", rr.Order.FeesPaid).
+		Str("state", string(rr.Order.State)).Str("strategy_id", intent.StrategyID)
+	if intent.ReduceOnly {
+		fillLive = fillLive.Bool("reduce_only", true)
 	}
+	fillLive = zerologFilledNotional(fillLive, rr.Order.FilledQty, rr.Order.AvgPrice, eqForPct)
+	if tverbose {
+		fillLive = fillLive.Str("local_id", rr.Order.ID).Str("exchange_id", rr.Order.ExchangeID).Str("trade_id", rr.Order.ExchangeTradeID).
+			Str("intent_id", intent.ID).Dur("rtt", rr.RTT)
+	}
+	fillLive.Msg("order_filled")
 	if (rr.Order.State == types.OrderFilled || rr.Order.State == types.OrderPartial) && rr.Order.ExchangeTradeID != "" &&
 		(intent.StopLossPrice > 0 || intent.TakeProfitPrice > 0) {
 		if c, ok := r.reg.Get(string(rr.Venue)); ok {
